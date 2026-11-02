@@ -1,0 +1,549 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<title>Garmin Dashboard</title>
+<style>
+:root{--p:#2563eb;--pd:#1d4ed8;--s:#64748b;--su:#10b981;--w:#f59e0b;--d:#ef4444;--bl:#f8fafc;--w:#fff;--tp:#1e293b;--ts:#64748b;--b:#e2e8f0;--sh:0 1px 3px rgba(0,0,0,.1);--r:8px}
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:var(--bl);color:var(--tp);line-height:1.6;min-height:100vh}
+.container{max-width:1600px;margin:0 auto;padding:20px}
+header{background:var(--w);border-bottom:1px solid var(--b);padding:15px 20px;position:sticky;top:0;z-index:100;box-shadow:var(--sh)}
+header h1{font-size:1.5rem;font-weight:600;color:var(--p);margin-bottom:5px}
+header p{font-size:.9rem;color:var(--ts)}
+.main-content{display:grid;grid-template-columns:280px 1fr;gap:20px;margin-top:20px}
+.sidebar{background:var(--w);border-radius:var(--r);box-shadow:var(--sh);padding:20px;height:fit-content}
+.sidebar h3{font-size:1rem;font-weight:600;color:var(--tp);margin-bottom:15px;padding-bottom:10px;border-bottom:1px solid var(--b)}
+.nav-tabs{display:flex;flex-direction:column;gap:5px}
+.nav-tab{padding:10px 15px;border:none;background:transparent;text-align:left;border-radius:var(--r);cursor:pointer;font-size:.9rem;transition:all .2s;display:flex;align-items:center;gap:10px}
+.nav-tab:hover{background:var(--bl)}
+.nav-tab.active{background:var(--p);color:#fff}
+.import-zone{background:var(--w);border-radius:var(--r);box-shadow:var(--sh);padding:30px;text-align:center;border:2px dashed var(--b);transition:all .3s;margin-bottom:20px;cursor:pointer}
+.import-zone:hover{border-color:var(--p);background:#f0f9ff}
+.import-zone.drag-over{border-color:var(--p);background:#eff6ff}
+.import-zone .icon{font-size:3rem;color:var(--p);margin-bottom:15px}
+.import-zone h3{font-size:1.1rem;margin-bottom:10px}
+.import-zone p{font-size:.9rem;color:var(--ts);margin-bottom:20px}
+.btn{padding:10px 20px;border:none;border-radius:var(--r);font-size:.9rem;font-weight:500;cursor:pointer;transition:all .2s;display:inline-flex;align-items:center;gap:8px}
+.btn-primary{background:var(--p);color:#fff}
+.btn-primary:hover{background:var(--pd)}
+.btn-secondary{background:var(--bl);color:var(--tp);border:1px solid var(--b)}
+.btn-sm{padding:6px 12px;font-size:.8rem}
+.kpi-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:15px;margin-bottom:20px}
+.kpi-card{background:var(--w);border-radius:var(--r);box-shadow:var(--sh);padding:20px;transition:transform .2s}
+.kpi-card:hover{transform:translateY(-2px)}
+.kpi-card .label{font-size:.8rem;color:var(--ts);text-transform:uppercase;letter-spacing:.5px;margin-bottom:8px}
+.kpi-card .value{font-size:1.8rem;font-weight:600;color:var(--tp);margin-bottom:5px}
+.kpi-card .trend{font-size:.8rem;display:flex;align-items:center;gap:5px}
+.kpi-card .trend.positive{color:var(--su)}
+.kpi-card .trend.negative{color:var(--d)}
+.controls{background:var(--w);border-radius:var(--r);box-shadow:var(--sh);padding:20px;margin-bottom:20px;display:flex;flex-wrap:wrap;gap:15px;align-items:center}
+.control-group{display:flex;flex-direction:column;gap:5px}
+.control-group label{font-size:.8rem;font-weight:500;color:var(--ts)}
+select,input[type="number"]{padding:8px 12px;border:1px solid var(--b);border-radius:var(--r);font-size:.9rem;background:var(--w);cursor:pointer}
+select:focus,input:focus{outline:none;border-color:var(--p)}
+.chart-container{background:var(--w);border-radius:var(--r);box-shadow:var(--sh);padding:20px;margin-bottom:20px}
+.chart-container h3{font-size:1rem;font-weight:600;margin-bottom:15px;display:flex;justify-content:space-between;align-items:center}
+.chart-wrapper{position:relative;height:300px;overflow:hidden}
+canvas{width:100%!important;height:100%!important}
+.table-container{background:var(--w);border-radius:var(--r);box-shadow:var(--sh);padding:20px}
+.table-container h3{font-size:1rem;font-weight:600;margin-bottom:15px}
+.data-table{width:100%;border-collapse:collapse}
+.data-table th,.data-table td{padding:12px 15px;text-align:left;border-bottom:1px solid var(--b)}
+.data-table th{font-size:.8rem;font-weight:600;color:var(--ts);text-transform:uppercase;letter-spacing:.5px;background:var(--bl)}
+.data-table tr:hover{background:var(--bl)}
+.status-badge{padding:4px 8px;border-radius:20px;font-size:.75rem;font-weight:500}
+.status-badge.ok{background:#d1fae5;color:#065f46}
+.status-badge.alert{background:#fee2e2;color:#991b1b}
+.zoom-view{display:none;background:var(--w);border-radius:var(--r);box-shadow:var(--sh);padding:20px;margin-top:20px}
+.zoom-view.active{display:block}
+.zoom-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:15px}
+.zoom-chart-wrapper{height:250px;position:relative}
+.modal{display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.5);z-index:1000;justify-content:center;align-items:center}
+.modal.active{display:flex}
+.modal-content{background:var(--w);border-radius:12px;padding:30px;max-width:500px;width:90%;box-shadow:var(--sh)}
+.modal-content h3{font-size:1.2rem;margin-bottom:15px}
+.modal-content p{margin-bottom:20px;color:var(--ts)}
+.modal-actions{display:flex;justify-content:flex-end;gap:10px}
+.spinner{display:inline-block;width:20px;height:20px;border:3px solid var(--b);border-top-color:var(--p);border-radius:50%;animation:spin 1s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+.hidden{display:none!important}.text-center{text-align:center}.mt-10{margin-top:10px}.mt-20{margin-top:20px}.mb-10{margin-bottom:10px}
+@media (max-width:1200px){.kpi-grid{grid-template-columns:repeat(2,1fr)}}
+@media (max-width:900px){.main-content{grid-template-columns:1fr}.kpi-grid{grid-template-columns:repeat(2,1fr)}}
+@media (max-width:600px){.kpi-grid{grid-template-columns:1fr}.controls{flex-direction:column;align-items:stretch}.control-group{width:100%}}
+</style>
+</head>
+<body>
+<header><h1>🏃‍♂️ Garmin Dashboard</h1><p>Visualisation locale de vos données santé</p></header>
+<div class="container">
+<div class="main-content">
+<aside class="sidebar">
+<h3>Navigation</h3>
+<div class="nav-tabs">
+<button class="nav-tab active" data-tab="overview"><span>📊</span><span>Aperçu</span></button>
+<button class="nav-tab" data-tab="activities"><span>🏃</span><span>Activités</span></button>
+<button class="nav-tab" data-tab="health"><span>❤️</span><span>Santé</span></button>
+<button class="nav-tab" data-tab="sleep"><span>😴</span><span>Sommeil</span></button>
+<button class="nav-tab" data-tab="settings"><span>⚙️</span><span>Paramètres</span></button>
+</div>
+<div class="mt-20"><button class="btn btn-secondary btn-sm" id="exportJsonBtn"><span>📥 Exporter JSON</span></button></div>
+<div class="mt-10"><button class="btn btn-secondary btn-sm" id="importJsonBtn"><span>📤 Importer JSON</span></button><input type="file" id="jsonFileInput" accept=".json" style="display:none"></div>
+</aside>
+<main>
+<div class="import-zone" id="dropZone"><div class="icon">📁</div><h3>Importer vos fichiers FIT</h3><p>Glissez-déposez vos fichiers .fit ici ou cliquez</p><button class="btn btn-primary" id="browseBtn"><span>📂 Parcourir</span></button><input type="file" id="fileInput" accept=".fit" multiple style="display:none"><p class="mt-10" id="fileStatus"></p></div>
+<div class="kpi-grid">
+<div class="kpi-card"><div class="label">FC Moyenne</div><div class="value" id="kpiHeartRate">-- bpm</div><div class="trend" id="kpiHeartRateTrend">--</div></div>
+<div class="kpi-card"><div class="label">Pas Totaux</div><div class="value" id="kpiSteps">--</div><div class="trend" id="kpiStepsTrend">--</div></div>
+<div class="kpi-card"><div class="label">Calories</div><div class="value" id="kpiCalories">-- kcal</div><div class="trend" id="kpiCaloriesTrend">--</div></div>
+<div class="kpi-card"><div class="label">Séances</div><div class="value" id="kpiSessions">--</div><div class="trend" id="kpiSessionsTrend">--</div></div>
+</div>
+<div class="controls">
+<div class="control-group"><label>Période</label><select id="periodSelect"><option value="7">7 jours</option><option value="30">30 jours</option><option value="90">90 jours</option><option value="365">1 an</option><option value="all">Tout</option></select></div>
+<div class="control-group"><label>Métrique</label><select id="metricSelect"><option value="heartRate">FC</option><option value="steps">Pas</option><option value="calories">Calories</option><option value="speed">Vitesse</option><option value="altitude">Altitude</option><option value="cadence">Cadence</option></select></div>
+<div class="control-group"><label>Seuil Min</label><input type="number" id="thresholdMin" placeholder="ex: 60"></div>
+<div class="control-group"><label>Seuil Max</label><input type="number" id="thresholdMax" placeholder="ex: 180"></div>
+<button class="btn btn-primary" id="applyFiltersBtn">🔍 Appliquer</button>
+</div>
+<div class="chart-container"><h3><span id="chartTitle">Évolution FC</span><div><button class="btn btn-secondary btn-sm" id="zoomOutBtn" style="display:none">🔍 Vue Globale</button></div></h3><div class="chart-wrapper"><canvas id="mainChart"></canvas></div></div>
+<div class="zoom-view" id="zoomView"><div class="zoom-header"><h3>Détail du <span id="zoomDate"></span></h3><button class="btn btn-secondary btn-sm" id="closeZoomBtn">✕ Fermer</button></div><div class="zoom-chart-wrapper"><canvas id="zoomChart"></canvas></div></div>
+<div class="table-container"><h3>Dernières Mesures</h3><table class="data-table"><thead><tr><th>Date</th><th>FC</th><th>Pas</th><th>Calories</th><th>Statut</th></tr></thead><tbody id="tableBody"><tr><td colspan="5" class="text-center">Aucune donnée</td></tr></tbody></table></div>
+</main></div></div>
+<div class="modal" id="modal"><div class="modal-content"><h3 id="modalTitle">Info</h3><p id="modalMessage"></p><div class="modal-actions"><button class="btn btn-primary" id="modalCloseBtn">OK</button></div></div></div>
+
+<script>
+// ============================================
+// GARMIN FIT PARSER
+// ============================================
+
+class FITParser {
+    constructor() {
+        this.MSG = {FILE_ID:0,SESSION:37,LAP:38,RECORD:39,EVENT:40,DEVICE_INFO:17,ACTIVITY:25,USER_PROFILE:3,SPORT:35,HRM_PROFILE:4,TOTALS:24,DEVICE_SETTINGS:2};
+        this.TYPE = {ENUM:0,SINT8:1,UINT8:2,SINT16:3,UINT16:4,SINT32:5,UINT32:6,STRING:7,FLOAT32:8,FLOAT64:9,UINT8Z:10,UINT16Z:11,UINT32Z:12,BYTE:13};
+        this.RF = {timestamp:253,heart_rate:3,speed:6,distance:5,altitude:9,cadence:4,power:7,steps:10,calories:13,temperature:18};
+    }
+
+    parse(file) {
+        return new Promise((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onload = (e) => {
+                try {
+                    const dv = new DataView(e.target.result);
+                    resolve(this.parseDV(dv));
+                } catch (err) {
+                    reject(new Error(`Erreur parsing ${file.name}: ${err.message}`));
+                }
+            };
+            reader.onerror = () => reject(new Error(`Erreur lecture ${file.name}`));
+            reader.readAsArrayBuffer(file);
+        });
+    }
+
+    parseDV(dv) {
+        const res = {records:[],sessions:[],laps:[],events:[],metadata:{}};
+        let pos = 14;
+        const defs = [];
+        while (pos < dv.byteLength - 2) {
+            const h = dv.getUint8(pos);
+            const isDef = (h & 0x80) !== 0;
+            const localNum = h & 0x0F;
+            if (isDef) {
+                defs[localNum] = this.parseDef(dv, pos);
+                pos += defs[localNum].size + 1;
+            } else {
+                const def = defs[localNum];
+                if (!def) { pos += 20; continue; }
+                const msg = this.parseMsg(dv, pos, def);
+                this.process(msg, res);
+                pos += def.size + 1;
+            }
+        }
+        return res;
+    }
+
+    parseDef(dv, pos) {
+        let p = pos + 1; p++; p++;
+        const gn = dv.getUint16(p, true); p += 2;
+        const nf = dv.getUint8(p); p++;
+        const fields = [];
+        for (let i = 0; i < nf; i++) {
+            fields.push({num: dv.getUint8(p), size: dv.getUint8(p+1), type: dv.getUint8(p+2)});
+            p += 3;
+        }
+        return {localMesgNum: (dv.getUint8(pos) & 0x0F), globalMesgNum: gn, size: p - pos - 1, fields};
+    }
+
+    parseMsg(dv, pos, def) {
+        let p = pos + 1; const data = {};
+        for (const f of def.fields) {
+            data[f.num] = this.readVal(dv, p, f); p += f.size;
+        }
+        return {globalMesgNum: def.globalMesgNum, data};
+    }
+
+    readVal(dv, pos, f) {
+        const t = f.type;
+        if (t === this.TYPE.STRING) return this.readStr(dv, pos, f.size);
+        if (t === this.TYPE.UINT8Z) return dv.getUint8(pos) === 0xFF ? null : dv.getUint8(pos);
+        const map = {
+            [this.TYPE.ENUM]:()=>dv.getUint8(pos),
+            [this.TYPE.UINT8]:()=>dv.getUint8(pos),
+            [this.TYPE.SINT8]:()=>dv.getInt8(pos),
+            [this.TYPE.UINT16]:()=>dv.getUint16(pos,true),
+            [this.TYPE.SINT16]:()=>dv.getInt16(pos,true),
+            [this.TYPE.UINT32]:()=>dv.getUint32(pos,true),
+            [this.TYPE.SINT32]:()=>dv.getInt32(pos,true),
+            [this.TYPE.FLOAT32]:()=>dv.getFloat32(pos,true),
+            [this.TYPE.FLOAT64]:()=>dv.getFloat64(pos,true)
+        };
+        return map[t] ? map[t]() : null;
+    }
+
+    readStr(dv, pos, len) {
+        const b = new Uint8Array(dv.buffer, pos, len);
+        let s = '';
+        for (let i = 0; i < b.length && b[i] !== 0; i++) s += String.fromCharCode(b[i]);
+        return s;
+    }
+
+    process(msg, res) {
+        const d = msg.data; const rf = this.RF;
+        switch (msg.globalMesgNum) {
+            case this.MSG.RECORD:
+                res.records.push({timestamp:d[rf.timestamp],heartRate:d[rf.heart_rate],speed:d[rf.speed],distance:d[rf.distance],altitude:d[rf.altitude],cadence:d[rf.cadence],power:d[rf.power],steps:d[rf.steps],calories:d[rf.calories],temperature:d[rf.temperature]});
+                break;
+            case this.MSG.SESSION:
+                res.sessions.push({startTime:d[0],duration:d[1],distance:d[5],calories:d[13],avgHeartRate:d[3],maxHeartRate:d[4],avgSpeed:d[6],maxSpeed:d[7],sport:d[35]});
+                break;
+            case this.MSG.LAP:
+                res.laps.push({startTime:d[0],duration:d[1],distance:d[5],calories:d[13],avgHeartRate:d[3],maxHeartRate:d[4]});
+                break;
+            case this.MSG.FILE_ID:
+                res.fileId = {type:d[0],manufacturer:d[1],product:d[2],serial:d[3],time:d[4]};
+                break;
+            case this.MSG.DEVICE_INFO:
+                res.metadata.deviceInfo = {deviceType:d[1],manufacturer:d[2],product:d[4]};
+                break;
+            case this.MSG.USER_PROFILE:
+                res.metadata.userProfile = {name:d[0],gender:d[1],age:d[2],height:d[3],weight:d[4]};
+                break;
+            case this.MSG.SPORT:
+                res.metadata.sport = {sport:d[0],subSport:d[1]};
+                break;
+        }
+    }
+
+    static fitTimestampToDate(ts) {
+        if (ts == null) return null;
+        const epoch = new Date(Date.UTC(1989, 11, 31));
+        return new Date(epoch.getTime() + ts * 1000);
+    }
+}
+
+// ============================================
+// APPLICATION
+// ============================================
+
+class GarminDashboard {
+    constructor() {
+        this.data = {records:[],sessions:[],laps:[],events:[],metadata:{}};
+        this.dailyData = {};
+        this.metrics = {
+            heartRate:{name:'FC',unit:'bpm',color:'#ef4444'},
+            steps:{name:'Pas',unit:'',color:'#3b82f6'},
+            calories:{name:'Calories',unit:'kcal',color:'#f59e0b'},
+            speed:{name:'Vitesse',unit:'km/h',color:'#10b981'},
+            altitude:{name:'Altitude',unit:'m',color:'#8b5cf6'},
+            cadence:{name:'Cadence',unit:'rpm',color:'#ec4899'}
+        };
+        this.currentPeriod = '7';
+        this.currentMetric = 'heartRate';
+        this.thresholdMin = null;
+        this.thresholdMax = null;
+        this.zoomDate = null;
+        this.zoomData = [];
+        this.init();
+    }
+
+    init() {
+        this.bindEvents();
+        this.loadFromLocalStorage();
+        this.updateUI();
+    }
+
+    bindEvents() {
+        document.querySelectorAll('.nav-tab').forEach(t => t.addEventListener('click', e => this.switchTab(e)));
+        const dz = document.getElementById('dropZone'), fi = document.getElementById('fileInput'), bb = document.getElementById('browseBtn');
+        dz.addEventListener('click',()=>fi.click());
+        bb.addEventListener('click',()=>fi.click());
+        fi.addEventListener('change',e=>this.handleFileSelect(e));
+        dz.addEventListener('dragover',e=>{e.preventDefault();dz.classList.add('drag-over')});
+        dz.addEventListener('dragleave',()=>dz.classList.remove('drag-over'));
+        dz.addEventListener('drop',e=>{e.preventDefault();dz.classList.remove('drag-over');this.handleFileSelect({target:{files:e.dataTransfer.files}})});
+        document.getElementById('periodSelect').addEventListener('change',e=>{this.currentPeriod=e.target.value;this.updateChart();this.updateKPI();this.updateTable();});
+        document.getElementById('metricSelect').addEventListener('change',e=>{this.currentMetric=e.target.value;this.updateChartTitle();this.updateChart();});
+        document.getElementById('thresholdMin').addEventListener('change',e=>this.thresholdMin=e.target.value?parseFloat(e.target.value):null);
+        document.getElementById('thresholdMax').addEventListener('change',e=>this.thresholdMax=e.target.value?parseFloat(e.target.value):null);
+        document.getElementById('applyFiltersBtn').addEventListener('click',()=>this.updateChart());
+        document.getElementById('zoomOutBtn').addEventListener('click',()=>this.zoomOut());
+        document.getElementById('closeZoomBtn').addEventListener('click',()=>this.zoomOut());
+        document.getElementById('exportJsonBtn').addEventListener('click',()=>this.exportToJSON());
+        document.getElementById('importJsonBtn').addEventListener('click',()=>document.getElementById('jsonFileInput').click());
+        document.getElementById('jsonFileInput').addEventListener('change',e=>this.importFromJSON(e));
+        document.getElementById('modalCloseBtn').addEventListener('click',()=>document.getElementById('modal').classList.remove('active'));
+        document.getElementById('mainChart').addEventListener('click',e=>this.handleChartClick(e));
+    }
+
+    switchTab(e) {
+        document.querySelectorAll('.nav-tab').forEach(t=>t.classList.remove('active'));
+        e.currentTarget.classList.add('active');
+    }
+
+    async handleFileSelect(e) {
+        const files = Array.from(e.target.files).filter(f=>f.name.toLowerCase().endsWith('.fit'));
+        if (files.length === 0) return;
+        const statusEl = document.getElementById('fileStatus');
+        statusEl.innerHTML = '<span class="spinner"></span> Chargement...';
+        try {
+            const parser = new FITParser();
+            let success = 0, errors = 0;
+            for (const file of files) {
+                try { const result = await parser.parse(file); this.processFITData(result); success++; }
+                catch(err) { errors++; }
+            }
+            this.aggregateDailyData();
+            this.saveToLocalStorage();
+            this.updateUI();
+            statusEl.textContent = `${success} fichier(s) importé(s), ${errors} erreur(s)`;
+            statusEl.style.color = errors > 0 ? 'var(--d)' : 'var(--su)';
+            if (errors > 0) this.showModal('Attention',`${errors} fichier(s) non importés`);
+            if (success > 0) this.showModal('Succès',`${success} fichier(s) importé(s)`);
+        } catch(err) {
+            statusEl.textContent = 'Erreur'; statusEl.style.color = 'var(--d)';
+            this.showModal('Erreur',err.message);
+        }
+        e.target.value = '';
+    }
+
+    processFITData(data) {
+        this.data.records = this.data.records.concat(data.records || []);
+        this.data.sessions = this.data.sessions.concat(data.sessions || []);
+        this.data.laps = this.data.laps.concat(data.laps || []);
+        this.data.events = this.data.events.concat(data.events || []);
+        if (!this.data.metadata.deviceInfo && data.metadata.deviceInfo) this.data.metadata.deviceInfo = data.metadata.deviceInfo;
+    }
+
+    aggregateDailyData() {
+        this.dailyData = {};
+        for (const r of this.data.records) {
+            const date = FITParser.fitTimestampToDate(r.timestamp);
+            if (!date) continue;
+            const ds = date.toISOString().split('T')[0];
+            if (!this.dailyData[ds]) this.dailyData[ds] = {date,heartRate:[],steps:[],calories:[],speed:[],altitude:[],cadence:[],timestamps:[]};
+            if (r.heartRate !== null) this.dailyData[ds].heartRate.push(r.heartRate);
+            if (r.steps !== null) this.dailyData[ds].steps.push(r.steps);
+            if (r.calories !== null) this.dailyData[ds].calories.push(r.calories);
+            if (r.speed !== null) this.dailyData[ds].speed.push(r.speed);
+            if (r.altitude !== null) this.dailyData[ds].altitude.push(r.altitude);
+            if (r.cadence !== null) this.dailyData[ds].cadence.push(r.cadence);
+            this.dailyData[ds].timestamps.push(r.timestamp);
+        }
+        for (const ds in this.dailyData) {
+            const d = this.dailyData[ds];
+            d.avgHeartRate = d.heartRate.length ? d.heartRate.reduce((a,b)=>a+b,0)/d.heartRate.length : null;
+            d.maxHeartRate = d.heartRate.length ? Math.max(...d.heartRate) : null;
+            d.totalSteps = d.steps.length ? d.steps[d.steps.length-1] : null;
+            d.totalCalories = d.calories.length ? d.calories[d.calories.length-1] : null;
+            d.avgSpeed = d.speed.length ? d.speed.reduce((a,b)=>a+b,0)/d.speed.length : null;
+            d.avgAltitude = d.altitude.length ? d.altitude.reduce((a,b)=>a+b,0)/d.altitude.length : null;
+            d.avgCadence = d.cadence.length ? d.cadence.reduce((a,b)=>a+b,0)/d.cadence.length : null;
+        }
+    }
+
+    updateUI() { this.updateKPI(); this.updateChart(); this.updateTable(); this.updateChartTitle(); }
+
+    updateKPI() {
+        const pd = this.getPeriodDays(), fd = this.getFilteredDailyData(pd);
+        const hr = [], steps = [], cal = [];
+        for (const ds in fd) { const d = fd[ds]; if (d.avgHeartRate !== null) hr.push(d.avgHeartRate); if (d.totalSteps !== null) steps.push(d.totalSteps); if (d.totalCalories !== null) cal.push(d.totalCalories); }
+        document.getElementById('kpiHeartRate').textContent = hr.length ? `${(hr.reduce((a,b)=>a+b,0)/hr.length).toFixed(1)} bpm` : '-- bpm';
+        document.getElementById('kpiSteps').textContent = steps.length ? steps.reduce((a,b)=>a+b,0).toLocaleString() : '--';
+        document.getElementById('kpiCalories').textContent = cal.length ? `${cal.reduce((a,b)=>a+b,0).toLocaleString()} kcal` : '-- kcal';
+        document.getElementById('kpiSessions').textContent = this.data.sessions.length;
+    }
+
+    updateChartTitle() { document.getElementById('chartTitle').textContent = `Évolution ${this.metrics[this.currentMetric].name}`; }
+
+    updateChart() {
+        const pd = this.getPeriodDays(), fd = this.getFilteredDailyData(pd);
+        const sd = Object.keys(fd).sort((a,b)=>new Date(a)-new Date(b));
+        const dates = [], values = [];
+        for (const ds of sd) { const d = fd[ds]; dates.push(d.date); let v = null;
+            switch(this.currentMetric) { case 'heartRate':v=d.avgHeartRate;break;case 'steps':v=d.totalSteps;break;case 'calories':v=d.totalCalories;break;case 'speed':v=d.avgSpeed;break;case 'altitude':v=d.avgAltitude;break;case 'cadence':v=d.avgCadence;break; }
+            values.push(v);
+        }
+        const ma = this.calculateMA(values,7);
+        this.drawMainChart(dates,values,ma);
+    }
+
+    calculateMA(values,ws) {
+        return values.map((v,i,a)=>{ const s=Math.max(0,i-Math.floor(ws/2)), e=Math.min(a.length,i+Math.ceil(ws/2)); const w=a.slice(s,e).filter(x=>x!==null); return w.length?w.reduce((x,y)=>x+y,0)/w.length:null; });
+    }
+
+    drawMainChart(dates,values,ma) {
+        const c = document.getElementById('mainChart'), ctx = c.getContext('2d'), m = this.metrics[this.currentMetric];
+        c.width = c.parentElement.clientWidth; c.height = c.parentElement.clientHeight;
+        const w = c.width, h = c.height, p = {t:20,r:20,b:40,l:60}, cw = w-p.l-p.r, ch = h-p.t-p.b;
+        ctx.clearRect(0,0,w,h);
+        const valid = values.filter(v=>v!==null);
+        if (valid.length === 0) { ctx.fillStyle='#64748b'; ctx.font='14px sans-serif'; ctx.textAlign='center'; ctx.fillText('Aucune donnée',w/2,h/2); return; }
+        let minV = Math.min(...valid), maxV = Math.max(...valid); const range = maxV-minV||1; const yMin = minV-range*0.1, yMax = maxV+range*0.1;
+        ctx.strokeStyle='#e2e8f0'; ctx.lineWidth=1;
+        ctx.beginPath(); ctx.moveTo(p.l,h-p.b); ctx.lineTo(w-p.r,h-p.b); ctx.stroke();
+        ctx.beginPath(); ctx.moveTo(p.l,p.t); ctx.lineTo(p.l,h-p.b); ctx.stroke();
+        for (let i=0;i<=5;i++) { const yV=yMin+(yMax-yMin)*i/5, yP=p.t+ch*(1-(yV-yMin)/(yMax-yMin));
+            ctx.beginPath(); ctx.moveTo(p.l-5,yP); ctx.lineTo(p.l,yP); ctx.stroke();
+            ctx.fillStyle='#64748b'; ctx.font='11px sans-serif'; ctx.textAlign='right'; ctx.fillText(yV.toFixed(1),p.l-10,yP+3); }
+        const xStep=Math.ceil(dates.length/8);
+        for (let i=0;i<dates.length;i+=xStep) { const xP=p.l+cw*i/(dates.length-1);
+            ctx.fillStyle='#64748b'; ctx.font='11px sans-serif'; ctx.textAlign='center';
+            ctx.fillText(dates[i].toLocaleDateString('fr-FR',{day:'2-digit',month:'short'}),xP,h-p.b+15); }
+        ctx.beginPath(); ctx.strokeStyle=m.color; ctx.lineWidth=2;
+        for (let i=0;i<values.length;i++) { if (values[i]===null) continue; const x=p.l+cw*i/(values.length-1), y=p.t+ch*(1-(values[i]-yMin)/(yMax-yMin));
+            if (i===0||values[i-1]===null) ctx.moveTo(x,y); else ctx.lineTo(x,y); }
+        ctx.stroke();
+        for (let i=0;i<values.length;i++) { if (values[i]===null) continue; const x=p.l+cw*i/(values.length-1), y=p.t+ch*(1-(values[i]-yMin)/(yMax-yMin));
+            const oor = (this.thresholdMin!==null&&values[i]<this.thresholdMin)||(this.thresholdMax!==null&&values[i]>this.thresholdMax);
+            ctx.fillStyle=oor?'#ef4444':m.color; ctx.beginPath(); ctx.arc(x,y,4,0,Math.PI*2); ctx.fill(); }
+        if (ma.some(v=>v!==null)) { ctx.beginPath(); ctx.strokeStyle='#64748b'; ctx.lineWidth=1; ctx.setLineDash([5,5]);
+            for (let i=0;i<ma.length;i++) { if (ma[i]===null) continue; const x=p.l+cw*i/(ma.length-1), y=p.t+ch*(1-(ma[i]-yMin)/(yMax-yMin));
+                if (i===0||ma[i-1]===null) ctx.moveTo(x,y); else ctx.lineTo(x,y); }
+            ctx.stroke(); ctx.setLineDash([]); }
+        if (this.thresholdMin!==null) { const y=p.t+ch*(1-(this.thresholdMin-yMin)/(yMax-yMin));
+            ctx.beginPath(); ctx.moveTo(p.l,y); ctx.lineTo(w-p.r,y); ctx.strokeStyle='#3b82f6'; ctx.lineWidth=1; ctx.setLineDash([5,5]); ctx.stroke(); ctx.setLineDash([]);
+            ctx.fillStyle='#3b82f6'; ctx.font='11px sans-serif'; ctx.textAlign='left'; ctx.fillText(`Min: ${this.thresholdMin}`,w-p.r+5,y-5); }
+        if (this.thresholdMax!==null) { const y=p.t+ch*(1-(this.thresholdMax-yMin)/(yMax-yMin));
+            ctx.beginPath(); ctx.moveTo(p.l,y); ctx.lineTo(w-p.r,y); ctx.strokeStyle='#ef4444'; ctx.lineWidth=1; ctx.setLineDash([5,5]); ctx.stroke(); ctx.setLineDash([]);
+            ctx.fillStyle='#ef4444'; ctx.font='11px sans-serif'; ctx.textAlign='left'; ctx.fillText(`Max: ${this.thresholdMax}`,w-p.r+5,y-5); }
+        ctx.save(); ctx.translate(15,h/2); ctx.rotate(-Math.PI/2); ctx.fillStyle='#64748b'; ctx.font='12px sans-serif'; ctx.textAlign='center'; ctx.fillText(m.unit,0,0); ctx.restore();
+    }
+
+    handleChartClick(e) {
+        const c = document.getElementById('mainChart'), r = c.getBoundingClientRect(), x = e.clientX-r.left;
+        const pd = this.getPeriodDays(), fd = this.getFilteredDailyData(pd);
+        const sd = Object.keys(fd).sort(); if (sd.length===0) return;
+        const p = {l:60,r:20}, cw = c.width-p.l-p.r, idx = Math.floor((x-p.l)/cw*(sd.length-1));
+        if (idx<0||idx>=sd.length) return; this.zoomIn(fd[sd[idx]].date,fd[sd[idx]]);
+    }
+
+    zoomIn(date,dayData) {
+        this.zoomDate=date; this.zoomData=dayData;
+        document.getElementById('zoomView').classList.add('active');
+        document.getElementById('zoomOutBtn').style.display='inline-block';
+        document.getElementById('zoomDate').textContent=date.toLocaleDateString('fr-FR',{day:'2-digit',month:'long',year:'numeric'});
+        this.drawZoomChart();
+    }
+
+    drawZoomChart() {
+        const c = document.getElementById('zoomChart'), ctx = c.getContext('2d'), m = this.metrics[this.currentMetric];
+        c.width = c.parentElement.clientWidth; c.height = c.parentElement.clientHeight;
+        const w = c.width, h = c.height, p = {t:20,r:20,b:40,l:60}, cw = w-p.l-p.r, ch = h-p.t-p.b;
+        ctx.clearRect(0,0,w,h);
+        let values=[], timestamps=[];
+        switch(this.currentMetric) { case 'heartRate':values=this.zoomData.heartRate;timestamps=this.zoomData.timestamps;break;
+            case 'steps':values=this.zoomData.steps;timestamps=this.zoomData.timestamps;break;
+            case 'calories':values=this.zoomData.calories;timestamps=this.zoomData.timestamps;break;
+            case 'speed':values=this.zoomData.speed;timestamps=this.zoomData.timestamps;break;
+            case 'altitude':values=this.zoomData.altitude;timestamps=this.zoomData.timestamps;break;
+            case 'cadence':values=this.zoomData.cadence;timestamps=this.zoomData.timestamps;break; }
+        if (!values||values.length===0) { ctx.fillStyle='#64748b'; ctx.font='14px sans-serif'; ctx.textAlign='center'; ctx.fillText('Aucune donnée',w/2,h/2); return; }
+        const maxPoints=500; if (values.length>maxPoints) { const step=Math.ceil(values.length/maxPoints);
+            values=values.filter((_,i)=>i%step===0); timestamps=timestamps.filter((_,i)=>i%step===0); }
+        const valid=values.filter(v=>v!==null); if (valid.length===0) { ctx.fillStyle='#64748b'; ctx.font='14px sans-serif'; ctx.textAlign='center'; ctx.fillText('Aucune donnée valide',w/2,h/2); return; }
+        let minV=Math.min(...valid), maxV=Math.max(...valid); const range=maxV-minV||1; const yMin=minV-range*0.1, yMax=maxV+range*0.1;
+        ctx.strokeStyle='#e2e8f0'; ctx.lineWidth=1;
+        ctx.beginPath(); ctx.moveTo(p.l,h-p.b); ctx.lineTo(w-p.r,h-p.b); ctx.stroke();
+        ctx.beginPath(); ctx.moveTo(p.l,p.t); ctx.lineTo(p.l,h-p.b); ctx.stroke();
+        for (let i=0;i<=5;i++) { const yV=yMin+(yMax-yMin)*i/5, yP=p.t+ch*(1-(yV-yMin)/(yMax-yMin));
+            ctx.beginPath(); ctx.moveTo(p.l-5,yP); ctx.lineTo(p.l,yP); ctx.stroke();
+            ctx.fillStyle='#64748b'; ctx.font='11px sans-serif'; ctx.textAlign='right'; ctx.fillText(yV.toFixed(1),p.l-10,yP+3); }
+        const xStep=Math.max(1,Math.ceil(values.length/8));
+        for (let i=0;i<values.length;i+=xStep) { const xP=p.l+cw*i/(values.length-1);
+            const time=FITParser.fitTimestampToDate(timestamps[i]);
+            ctx.fillStyle='#64748b'; ctx.font='11px sans-serif'; ctx.textAlign='center';
+            ctx.fillText(`${time.getHours().toString().padStart(2,'0')}:${time.getMinutes().toString().padStart(2,'0')}`,xP,h-p.b+15); }
+        ctx.beginPath(); ctx.strokeStyle=m.color; ctx.lineWidth=2;
+        for (let i=0;i<values.length;i++) { if (values[i]===null) continue; const x=p.l+cw*i/(values.length-1), y=p.t+ch*(1-(values[i]-yMin)/(yMax-yMin));
+            if (i===0||values[i-1]===null) ctx.moveTo(x,y); else ctx.lineTo(x,y); }
+        ctx.stroke();
+        for (let i=0;i<values.length;i++) { if (values[i]===null) continue; const x=p.l+cw*i/(values.length-1), y=p.t+ch*(1-(values[i]-yMin)/(yMax-yMin));
+            const oor=(this.thresholdMin!==null&&values[i]<this.thresholdMin)||(this.thresholdMax!==null&&values[i]>this.thresholdMax);
+            ctx.fillStyle=oor?'#ef4444':m.color; ctx.beginPath(); ctx.arc(x,y,3,0,Math.PI*2); ctx.fill(); }
+        if (this.thresholdMin!==null) { const y=p.t+ch*(1-(this.thresholdMin-yMin)/(yMax-yMin));
+            ctx.beginPath(); ctx.moveTo(p.l,y); ctx.lineTo(w-p.r,y); ctx.strokeStyle='#3b82f6'; ctx.lineWidth=1; ctx.setLineDash([5,5]); ctx.stroke(); ctx.setLineDash([]); }
+        if (this.thresholdMax!==null) { const y=p.t+ch*(1-(this.thresholdMax-yMin)/(yMax-yMin));
+            ctx.beginPath(); ctx.moveTo(p.l,y); ctx.lineTo(w-p.r,y); ctx.strokeStyle='#ef4444'; ctx.lineWidth=1; ctx.setLineDash([5,5]); ctx.stroke(); ctx.setLineDash([]); }
+        ctx.save(); ctx.translate(15,h/2); ctx.rotate(-Math.PI/2); ctx.fillStyle='#64748b'; ctx.font='12px sans-serif'; ctx.textAlign='center'; ctx.fillText(m.unit,0,0); ctx.restore();
+    }
+
+    zoomOut() {
+        document.getElementById('zoomView').classList.remove('active');
+        document.getElementById('zoomOutBtn').style.display='none';
+        this.zoomDate=null; this.zoomData=[];
+    }
+
+    updateTable() {
+        const pd = this.getPeriodDays(), fd = this.getFilteredDailyData(pd);
+        const tbody = document.getElementById('tableBody');
+        const sd = Object.keys(fd).sort((a,b)=>new Date(b)-new Date(a));
+        if (sd.length===0) { tbody.innerHTML='<tr><td colspan="5" class="text-center">Aucune donnée</td></tr>'; return; }
+        let html='';
+        for (const ds of sd.slice(0,20)) { const d=fd[ds]; let status='ok', text='OK';
+            if (d.avgHeartRate!==null) { if (this.thresholdMin!==null&&d.avgHeartRate<this.thresholdMin) { status='alert'; text='Faible'; }
+                else if (this.thresholdMax!==null&&d.avgHeartRate>this.thresholdMax) { status='alert'; text='Élevée'; } }
+            html+=`<tr><td>${d.date.toLocaleDateString('fr-FR')}</td><td>${d.avgHeartRate!==null?d.avgHeartRate.toFixed(1):'--'}</td><td>${d.totalSteps!==null?d.totalSteps.toLocaleString():'--'}</td><td>${d.totalCalories!==null?d.totalCalories.toLocaleString():'--'}</td><td><span class="status-badge ${status}">${text}</span></td></tr>`; }
+        tbody.innerHTML=html;
+    }
+
+    getFilteredDailyData(pd) {
+        const now=new Date(), start=new Date(now.getTime()-pd*24*60*60*1000);
+        const fd={}; for (const ds in this.dailyData) if (this.dailyData[ds].date>=start) fd[ds]=this.dailyData[ds];
+        return fd;
+    }
+
+    getPeriodDays() { return {7:7,30:30,90:90,365:365,all:3650}[this.currentPeriod]||7; }
+
+    saveToLocalStorage() {
+        try { localStorage.setItem('garminDashboardData',JSON.stringify({dailyData:this.dailyData,sessions:this.data.sessions,lastUpdate:new Date().toISOString()})); }
+        catch(e) { console.error('Erreur sauvegarde:',e); }
+    }
+
+    loadFromLocalStorage() {
+        try { const s=localStorage.getItem('garminDashboardData'); if (s) { const p=JSON.parse(s); this.dailyData=p.dailyData||{}; this.data.sessions=p.sessions||[]; } }
+        catch(e) { console.error('Erreur chargement:',e); }
+    }
+
+    exportToJSON() {
+        const blob=new Blob([JSON.stringify({dailyData:this.dailyData,sessions:this.data.sessions,exportedAt:new Date().toISOString()},null,2)],{type:'application/json'});
+        const url=URL.createObjectURL(blob); const a=document.createElement('a'); a.href=url; a.download=`garmin_${new Date().toISOString().split('T')[0]}.json`;
+        document.body.appendChild(a); a.click(); document.body.removeChild(a); URL.revokeObjectURL(url);
+    }
+
+    importFromJSON(e) {
+        const file=e.target.files[0]; if (!file) return;
+        const reader=new FileReader();
+        reader.onload=(e)=>{ try { const d=JSON.parse(e.target.result); this.dailyData=d.dailyData||{}; this.data.sessions=d.sessions||[]; this.saveToLocalStorage(); this.updateUI(); this.showModal('Succès','Données importées'); }
+            catch(err) { this.showModal('Erreur',err.message); } };
+        reader.readAsText(file); e.target.value='';
+    }
+
+    showModal(title,message) {
+        document.getElementById('modalTitle').textContent=title;
+        document.getElementById('modalMessage').textContent=message;
+        document.getElementById('modal').classList.add('active');
+    }
+}
+
+document.addEventListener('DOMContentLoaded',()=>new GarminDashboard());
+</script>
+</body>
+</html>
