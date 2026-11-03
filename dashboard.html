@@ -1998,11 +1998,19 @@ function initUI() {
     function avgField(f) { let s = 0, n = 0; for (const v of agg.values()) { const x = dayStartMs(v.date); if (x >= from - 864e5 && x <= to && typeof v[f] === 'number') { s += v[f]; n++; } } return n ? Math.round(s / n) : '—'; }
     function lastField(f) { let last = null; for (const v of agg.values()) { const x = dayStartMs(v.date); if (x >= from - 864e5 && x <= to && typeof v[f] === 'number') last = v[f]; } return last === null ? null : Math.round(last); }
     function aggHas(f) { for (const v of agg.values()) if (typeof v[f] === 'number') return true; return false; }
+    // tendance 7 j vs 7 j précédents pour la métrique sélectionnée (affichée dans sa carte)
+    let sousSel = null;
+    if (METRICS[state.metriqueAccueil] && METRICS[state.metriqueAccueil].source !== 'record') {
+      const kt = computeKPIs(store, state.metriqueAccueil, state.periode, 'tout', state.custom);
+      if (kt.tendance !== null && isFinite(kt.tendance))
+        sousSel = 'tendance ' + (kt.tendance > 0 ? '▲ +' : kt.tendance < 0 ? '▼ −' : '= ') + Math.abs(kt.tendance).toFixed(0) + ' % vs 7 j préc.';
+    }
     $('kpiAccueil').innerHTML = kpis.map(k => {
       const sel = k.met && k.met === state.metriqueAccueil ? ' sel' : '';
       const cible = k.action || '';
       const spark = k.met ? '<canvas class="spark" data-met="' + k.met + '"></canvas>' : '';
-      return '<div class="kpi' + sel + '" data-met="' + (k.met || '') + '" data-vue-cible="' + cible + '"><div class="label">' + esc(k.label) + '</div><div class="value">' + k.value + '</div>' + spark + '<div class="sous">' + esc(k.sous) + '</div></div>';
+      const sous = (sel && sousSel) ? sousSel : k.sous;
+      return '<div class="kpi' + sel + '" data-met="' + (k.met || '') + '" data-vue-cible="' + cible + '"><div class="label">' + esc(k.label) + '</div><div class="value">' + k.value + '</div>' + spark + '<div class="sous">' + esc(sous) + '</div></div>';
     }).join('');
     // sparklines des cartes KPI (série journalière de chaque métrique)
     document.querySelectorAll('#kpiAccueil .kpi .spark').forEach(cv => {
