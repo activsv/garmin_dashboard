@@ -466,7 +466,15 @@ class FitParser {
       if (fd) {
         let out = val;
         if (val !== null && !Array.isArray(val)) {
-          if (fd.convert === 'timestamp' && typeof val === 'number') out = new Date(FIT_EPOCH_MS + val * 1000).toISOString();
+          if (fd.convert === 'timestamp') {
+          let tv = val;
+          if (typeof tv === 'string' && tv.length >= 4) {
+            let n = 0;
+            for (let i = 0; i < 4; i++) n += (tv.charCodeAt(i) & 0xFF) * 2 ** (8 * i);
+            tv = n >>> 0;
+          }
+          if (typeof tv === 'number') out = new Date(FIT_EPOCH_MS + tv * 1000).toISOString();
+        }
           else if (fd.convert === 'semicircles' && typeof val === 'number') out = val * (180 / 2147483648);
           else if (fd.scale) out = val / fd.scale + (fd.offset || 0);
         }
@@ -483,8 +491,16 @@ class FitParser {
    données chronologique unique. Dédouillonage : les records sont indexés par
    timestamp (ms) et fusionnés champ par champ ; les sessions par (début, sport).
    ========================================================================== */
+/* Timestamp FIT -> ms. Tolère les fichiers non standard qui déclarent le
+   champ date_time (253, 2, ...) en "string" de 4 octets : on relit les octets
+   en uint32 little-endian. */
 function fitTimestampMs(m, rawField) {
-  const v = m.raw[rawField];
+  let v = m.raw[rawField];
+  if (typeof v === 'string' && v.length >= 4) {
+    let n = 0;
+    for (let i = 0; i < 4; i++) n += (v.charCodeAt(i) & 0xFF) * 2 ** (8 * i);
+    v = n >>> 0;
+  }
   if (typeof v === 'number') return FIT_EPOCH_MS + v * 1000;
   return null;
 }
@@ -802,10 +818,10 @@ function initUI() {
   let fichierSel = null;
   const state = { vue: 'fichiers', groupe: 'record', periode: '30j', metrique: 'heart_rate', seuilMin: null, seuilMax: null, zoomJour: null };
 
-  initControles();
-
   const $ = id => document.getElementById(id);
   const dropZone = $('dropZone'), fileInput = $('fileInput'), jsonInput = $('jsonInput');
+
+  initControles();
 
   $('btnParcourir').addEventListener('click', e => { e.stopPropagation(); fileInput.click(); });
   dropZone.addEventListener('click', () => fileInput.click());
