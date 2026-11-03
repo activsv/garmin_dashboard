@@ -88,6 +88,13 @@ const kStress = M.computeKPIs(store, 'stress', 'tout', 'tout');
 ok(kStress.series.length === 5, 'série stress = 5 jours');
 ok(typeof kStress.tendance === 'number' || kStress.tendance === null, 'tendance calculée sans erreur', kStress.tendance);
 
+console.log('== Zones de FC (temps par zone) ==');
+const zt = M.zoneTimeByDay(store, 0, Date.now());
+ok(zt.zones.length === 5, '5 zones de FC (fallback % FCmax)', zt.zones.length);
+ok(zt.series.length === 2, 'temps par zone agrégé sur 2 jours de séances', zt.series.length);
+const totSec = zt.series.reduce((a, s) => a + Object.values(s.z).reduce((x, y) => x + y, 0), 0);
+ok(totSec > 1500 && totSec < 6000, 'total ~durée des séances (1800s + 3600s)', totSec);
+
 console.log('== Sommeil ==');
 const nuits = M.sleepNights(store);
 ok(nuits.length === 2, '2 nuits détectées', nuits.length);

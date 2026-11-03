@@ -274,6 +274,11 @@ details summary{cursor:pointer;color:var(--texte2);font-size:.8rem}
         <h3>Derniers jours</h3>
         <div class="zone-scroll" style="max-height:320px"><table id="tableSante"><thead></thead><tbody></tbody></table></div>
       </div>
+      <div class="carte" id="carteZones" style="display:none">
+        <h3>Temps dans les zones de fréquence cardiaque (séances)</h3>
+        <div class="chart-wrap" style="height:280px"><canvas id="chartZones"></canvas></div>
+        <div class="legend" id="legendeZones"></div>
+      </div>
     </div>
   </section>
 
@@ -1189,6 +1194,31 @@ function getHrZones(store) {
   return { zones, fcmax };
 }
 
+/* Temps passé dans chaque zone de FC, par jour, calculé depuis les records
+   (delta entre records consécutifs, plafonné à 60 s). Retourne
+   { series: [{date, x, z: {label: secondes}}], zones }. */
+function zoneTimeByDay(store, from, to) {
+  const hz = getHrZones(store);
+  if (!hz || !hz.zones || !hz.zones.length) return { series: [], zones: [] };
+  const recs = store.recordsSorted()
+    .filter(r => r.t >= from && r.t <= to && typeof r.heart_rate === 'number' && r.heart_rate > 0);
+  const byDay = new Map();
+  let prev = null;
+  for (const r of recs) {
+    if (prev && r.t > prev.t) {
+      const dt = Math.min((r.t - prev.t) / 1000, 60);
+      const zone = hz.zones.find(z => r.heart_rate >= z.y0 && r.heart_rate <= z.y1) || hz.zones[hz.zones.length - 1];
+      const d = localDayKey(r.t);
+      let e = byDay.get(d);
+      if (!e) { e = { date: d, x: dayStartMs(d), z: {} }; byDay.set(d, e); }
+      e.z[zone.label] = (e.z[zone.label] || 0) + dt;
+    }
+    prev = r;
+  }
+  const series = Array.from(byDay.values()).sort((a, b) => a.x - b.x);
+  return { series, zones: hz.zones };
+}
+
 /* Nuits de sommeil depuis sleep_level (275) : groupées par nuit (voir
    sleepDayKey), durée = dernier - premier timestamp (+ delta moyen de la
    dernière tranche), répartition par niveau. */
@@ -1804,6 +1834,52 @@ function initUI() {
     h += '<span class="item petit">clic sur un point = détail de la journée</span>';
     return h;
   }
+  /* Barres empilées (temps dans les zones de FC par jour). */
+  function drawStackedBars(cv, series, zones) {
+    const { ctx, w, h } = prepCanvas(cv);
+    ctx.clearRect(0, 0, w, h);
+    const p = { t: 14, r: 14, b: 30, l: 58 };
+    const cw = w - p.l - p.r, ch = h - p.t - p.b;
+    if (!series.length) {
+      ctx.fillStyle = '#94a3b8'; ctx.font = '13px sans-serif'; ctx.textAlign = 'center';
+      ctx.fillText('Aucune donnée de fréquence cardiaque sur la période', w / 2, h / 2);
+      return;
+    }
+    const xs = series.map(s => s.x);
+    let xMin = Math.min(...xs), xMax = Math.max(...xs);
+    if (xMin === xMax) { xMin -= 432e5; xMax += 432e5; }
+    const totals = series.map(s => zones.reduce((a, z) => a + (s.z[z.label] || 0), 0));
+    let yMax = Math.max(...totals);
+    if (yMax <= 0) yMax = 1;
+    yMax *= 1.08;
+    const X = x => p.l + (x - xMin) / (xMax - xMin) * cw;
+    const Y = y => p.t + ch - (y / yMax) * ch;
+    ctx.font = '11px sans-serif'; ctx.textAlign = 'right'; ctx.textBaseline = 'middle';
+    for (let i = 0; i <= 4; i++) {
+      const y = yMax * i / 4;
+      ctx.strokeStyle = '#eef2f7'; ctx.beginPath(); ctx.moveTo(p.l, Y(y)); ctx.lineTo(p.l + cw, Y(y)); ctx.stroke();
+      ctx.fillStyle = '#94a3b8';
+      ctx.fillText((y / 60).toFixed(y >= 3600 ? 1 : 0) + ' min', p.l - 8, Y(y));
+    }
+    ctx.textAlign = 'center'; ctx.textBaseline = 'top';
+    const nTicks = Math.min(8, Math.max(2, Math.floor(cw / 90)));
+    for (let i = 0; i <= nTicks; i++) {
+      const x = xMin + (xMax - xMin) * i / nTicks;
+      ctx.fillStyle = '#94a3b8';
+      ctx.fillText(fmtJour(x), X(x), p.t + ch + 8);
+    }
+    const bw = Math.max(2, cw / series.length * 0.6);
+    for (const s of series) {
+      let yAcc = 0;
+      for (const z of zones) {
+        const v = s.z[z.label] || 0;
+        if (!v) continue;
+        ctx.fillStyle = z.color;
+        ctx.fillRect(X(s.x) - bw / 2, Y(yAcc + v), bw, Y(yAcc) - Y(yAcc + v));
+        yAcc += v;
+      }
+    }
+  }
   /* Mini-graphique (sparkline) pour les cartes KPI : courbe seule, sans axes. */
   function drawSpark(cv, series, color) {
     const { ctx, w, h } = prepCanvas(cv);
@@ -2214,6 +2290,14 @@ function initUI() {
       kpiCard('Séances', String(k.seances), 'dans la période');
     renderGraphiqueVue('Sante', state.metrique, k.series, state.zoomSante, d => { state.zoomSante = d; renderSante(); });
     renderTableJours($('tableSante'), null, k.series);
+    // temps dans les zones de FC (barres empilées, depuis les séances)
+    const zt = zoneTimeByDay(store, k.from, k.to);
+    if (zt.series.length) {
+      $('carteZones').style.display = 'block';
+      drawStackedBars($('chartZones'), zt.series, zt.zones);
+      $('legendeZones').innerHTML = zt.zones.map(z =>
+        '<span class="item"><span style="display:inline-block;width:10px;height:10px;border-radius:2px;background:' + z.color + '"></span>' + esc(z.label) + '</span>').join('');
+    } else $('carteZones').style.display = 'none';
   }
   /* Tableau des derniers jours avec statut OK/alerte selon les seuils.
      titreEl optionnel : élément de titre à mettre à jour (null = inchangé). */
@@ -2269,7 +2353,7 @@ function initUI() {
 
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = { FitParser, DataStore, fitCrc16, applyCompressedOffset, GLOBAL_MESSAGES, FIELD_DEFS, ENUMS, FIT_EPOCH_MS, fitTimestampMs,
-    METRICS, PERIODES, lttb, dailySeries, movingAverage, periodBounds, dailyAgg, dailyMetricSeries, recordSeriesFor, computeKPIs, sleepNights, sleepDayKey, getHrZones, localDayKey, dayStartMs,
+    METRICS, PERIODES, lttb, dailySeries, movingAverage, periodBounds, dailyAgg, dailyMetricSeries, recordSeriesFor, computeKPIs, sleepNights, sleepDayKey, getHrZones, zoneTimeByDay, localDayKey, dayStartMs,
     sportLabel, fileTypeLabel };
 }
 if (typeof document !== 'undefined') {
