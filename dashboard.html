@@ -271,7 +271,7 @@ details summary{cursor:pointer;color:var(--texte2);font-size:.8rem}
         <div class="chart-wrap"><canvas id="zoomSante"></canvas></div>
       </div>
       <div class="carte">
-        <h3>Derniers jours</h3>
+        <h3>Derniers jours <button class="btn secondaire btn-sm" id="btnExportCsv" style="margin-left:10px">Exporter CSV</button></h3>
         <div class="zone-scroll" style="max-height:320px"><table id="tableSante"><thead></thead><tbody></tbody></table></div>
       </div>
       <div class="carte" id="carteZones" style="display:none">
@@ -328,6 +328,10 @@ details summary{cursor:pointer;color:var(--texte2);font-size:.8rem}
       <p class="petit">Alternative : « Sélectionner un dossier… » importe directement tous les .fit d'un dossier, sans copie. Les dossiers choisis (étapes 1 et 2) sont mémorisés dans ce navigateur.</p>
     </div>
 
+    <div class="carte" id="carteAppareil" style="display:none">
+      <h3>Appareil &amp; profil</h3>
+      <div id="infosAppareil" class="petit" style="line-height:1.9"></div>
+    </div>
     <div class="carte">
       <h3>Fichiers importés</h3>
       <div class="liste" id="listeFichiers"></div>
@@ -1316,6 +1320,7 @@ function initUI() {
     $('btnFermerSeance').addEventListener('click', () => { seanceSel = null; renderActivites(); });
     $('btnVoirActivites').addEventListener('click', () => { const s = derniereSeance(); if (s) { seanceSel = s; } showVue('activites'); });
     $('btnExportGpx').addEventListener('click', () => exportGpxSeance());
+    $('btnExportCsv').addEventListener('click', () => exportCsvJours());
     // période libre (dates)
     const majDates = () => {
       const du = $('dateDu').value, au = $('dateAu').value;
@@ -1578,6 +1583,7 @@ function initUI() {
   /* ---------- onglet Fichiers : liste + détail ---------- */
   function renderFichiers() {
     renderStatut();
+    renderAppareil();
     $('aucunFichier').style.display = store.files.length ? 'none' : 'block';
     const liste = $('listeFichiers');
     liste.innerHTML = '';
@@ -2188,6 +2194,61 @@ function initUI() {
     const gps = store.gps.filter(g => !plage || (g.t >= plage[0] - 6e4 && g.t <= plage[1] + 6e4));
     if (gps.length > 1) { $('carteCarteGps').style.display = 'block'; drawCarteGps(gps); }
     else $('carteCarteGps').style.display = 'none';
+  }
+  /* Export CSV des agrégats journaliers (santé), 100 % local. */
+  function exportCsvJours() {
+    const agg = dailyAgg(store);
+    const rows = Array.from(agg.values()).sort((a, b) => a.date.localeCompare(b.date));
+    const head = ['date', 'pas', 'distance_km', 'calories_kcal', 'temps_actif_min', 'fc_moy_bpm', 'fc_min_bpm', 'fc_max_bpm', 'fc_repos_bpm', 'stress_moy'];
+    const lines = [head.join(';')];
+    for (const r of rows) {
+      lines.push([r.date,
+        r.steps ?? '', r.distance !== null ? (r.distance / 1000).toFixed(2) : '',
+        r.calories ?? '', r.active_time !== null ? (r.active_time / 60).toFixed(0) : '',
+        r.hr_avg !== null ? r.hr_avg.toFixed(1) : '', r.hr_min ?? '', r.hr_max ?? '',
+        r.hr_rest ?? '', r.stress_avg !== null ? r.stress_avg.toFixed(1) : ''].join(';'));
+    }
+    const csv = '﻿' + lines.join('\n');
+    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'garmin-jours.csv';
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+    setStatut('Export CSV : ' + rows.length + ' jour(s) exporté(s).');
+  }
+  /* Carte « Appareil & profil » (device_info, user_profile, file_id). */
+  function renderAppareil() {
+    const carte = $('carteAppareil');
+    const di = (store.other.device_info || []).slice(-1)[0];
+    const fid = store.files.filter(f => f.parsed).map(f => f.parsed.messages.find(m => m.name === 'file_id')).find(Boolean);
+    const up = store.userProfile || {};
+    const lignes = [];
+    if (fid) {
+      lignes.push('<b>Fichier :</b> ' + esc(fileTypeLabel(fid.fields.type)) +
+        (fid.fields.manufacturer != null ? ', fabricant ' + esc(manufacturerLabel(fid.fields.manufacturer)) : '') +
+        (fid.fields.product_name ? ', produit ' + esc(fid.fields.product_name) : '') +
+        (fid.fields.serial_number ? ', n° série ' + esc(fid.fields.serial_number) : ''));
+    }
+    if (di) {
+      lignes.push('<b>Appareil :</b>' +
+        (di.manufacturer != null ? ' ' + esc(manufacturerLabel(di.manufacturer)) : '') +
+        (di.product != null ? ', produit ' + esc(di.product) : '') +
+        (di.software_version != null ? ', logiciel ' + esc(di.software_version) : '') +
+        (di.battery_status != null ? ', batterie ' + esc(di.battery_status) : ''));
+    }
+    if (up && Object.keys(up).length) {
+      lignes.push('<b>Profil :</b>' +
+        (up.age ? ' ' + esc(up.age) + ' ans' : '') +
+        (up.gender != null ? ', ' + esc(up.gender === 0 ? 'homme' : 'femme') : '') +
+        (up.weight ? ', ' + esc(up.weight) + ' kg' : '') +
+        (up.height ? ', ' + esc(up.height) + ' m' : '') +
+        (up.resting_heart_rate ? ', FC repos ' + esc(up.resting_heart_rate) + ' bpm' : '') +
+        (up.default_max_heart_rate ? ', FC max ' + esc(up.default_max_heart_rate) + ' bpm' : ''));
+    }
+    if (!lignes.length) { carte.style.display = 'none'; return; }
+    carte.style.display = 'block';
+    $('infosAppareil').innerHTML = lignes.map(l => '<div>' + l + '</div>').join('');
   }
   /* Export GPX de la séance sélectionnée (points GPS + FC/cadence), 100 % local. */
   function exportGpxSeance() {
