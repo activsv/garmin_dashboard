@@ -1361,7 +1361,11 @@ function initUI() {
   fileInput.addEventListener('change', () => { importFiles(fileInput.files); fileInput.value = ''; });
   ['dragenter', 'dragover'].forEach(ev => dropZone.addEventListener(ev, e => { e.preventDefault(); dropZone.classList.add('over'); }));
   ['dragleave', 'drop'].forEach(ev => dropZone.addEventListener(ev, e => { e.preventDefault(); dropZone.classList.remove('over'); }));
-  dropZone.addEventListener('drop', e => importFiles(e.dataTransfer.files));
+  dropZone.addEventListener('drop', e => {
+    const json = Array.from(e.dataTransfer.files).find(f => f.name.toLowerCase().endsWith('.json'));
+    if (json) { importJsonFile(json); return; }
+    importFiles(e.dataTransfer.files);
+  });
 
   async function importFiles(fileList) {
     const files = Array.from(fileList).filter(f => f.name.toLowerCase().endsWith('.fit'));
@@ -1388,10 +1392,12 @@ function initUI() {
     setStatut('Jeu de données exporté en JSON (' + store.records.size + ' points, ' + store.sessions.length + ' séance(s)).');
   });
   $('btnImport').addEventListener('click', () => jsonInput.click());
-  jsonInput.addEventListener('change', async e => {
+  jsonInput.addEventListener('change', e => {
     const f = e.target.files[0];
     e.target.value = '';
-    if (!f) return;
+    if (f) importJsonFile(f);
+  });
+  async function importJsonFile(f) {
     try {
       store = DataStore.fromJSON(await f.text());
       fichierSel = null; seanceSel = null;
@@ -1399,7 +1405,7 @@ function initUI() {
     } catch (err) {
       setStatut('<span class="err">Import JSON impossible : ' + esc(err.message) + '</span>');
     }
-  });
+  }
 
   /* ---------- sélection de dossier (File System Access API + fallback) ---------- */
   function idbOpen() {
@@ -1591,9 +1597,12 @@ function initUI() {
       const div = document.createElement('div');
       div.className = 'item' + (fichierSel === f.id ? ' sel' : '');
       const counts = f.parsed ? countMessages(f.parsed) : '';
+      const fid = f.parsed && f.parsed.messages.find(m => m.name === 'file_id');
+      const typeBadge = fid && fid.fields.type !== undefined && fid.fields.type !== null
+        ? ' <span class="badge info">' + esc(fileTypeLabel(fid.fields.type)) + '</span>' : '';
       div.innerHTML =
         '<div class="nom">' + esc(f.name) + '</div>' +
-        '<div class="meta">' + fmtTaille(f.size) +
+        '<div class="meta">' + fmtTaille(f.size) + typeBadge +
         (f.error
           ? ' — <span class="err">ERREUR : ' + esc(f.error) + '</span>'
           : f.doublon
