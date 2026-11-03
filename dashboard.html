@@ -2,11 +2,11 @@
 <!--
 ================================================================================
  GARMIN DASHBOARD — Visualiseur de fichiers FIT 100 % local
- (État d'avancement : étapes 1-4 réalisées — parseur FIT, modèle de données
+ (État d'avancement : étapes 1-6 réalisées — parseur FIT, modèle de données
   agrégé/dédoublonné, export/import JSON, onglets Activités / Santé / Sommeil
-  avec KPIs, sélecteur de période, graphique Canvas (moyenne glissante 7 j,
-  seuils, hors-seuil, zoom jour), tableau avec statut. Étape 5 : finitions.
-  Étape 6 : synchro montre -> PC.)
+  avec KPIs, sélecteur de période, graphiques Canvas (moyenne glissante 7 j,
+  seuils, hors-seuil, zoom jour, sous-échantillonnage LTTB), tableau avec
+  statut, sélection de dossier et synchro incrémentale montre -> PC.)
 ================================================================================
  Fichier unique et autonome : aucun serveur, aucune dépendance externe, aucune
  donnée envoyée sur le réseau. Ouvrir simplement ce fichier dans un navigateur
@@ -140,11 +140,15 @@ h3{font-size:.98rem;margin-bottom:12px}
       <p>Plusieurs fichiers acceptés (activités, monitoring, sommeil…).</p>
       <div class="boutons">
         <button class="btn" id="btnParcourir">Parcourir des fichiers .fit…</button>
+        <button class="btn secondaire" id="btnDossier" title="Importer tous les .fit d'un dossier (récursif)">Sélectionner un dossier…</button>
+        <button class="btn secondaire" id="btnSync" title="Copier les nouveaux .fit de la montre vers un dossier du PC, puis les importer">Synchroniser depuis la montre…</button>
         <button class="btn secondaire" id="btnExport" title="Exporter le jeu de données agrégé en JSON">Exporter JSON</button>
         <button class="btn secondaire" id="btnImport" title="Recharger un export JSON précédent">Importer JSON…</button>
       </div>
       <input type="file" id="fileInput" accept=".fit" multiple hidden>
+      <input type="file" id="dirInput" webkitdirectory hidden>
       <input type="file" id="jsonInput" accept=".json,application/json" hidden>
+      <div id="syncRapport" class="petit" style="margin-top:12px"></div>
     </div>
   </div>
   <div id="statut"></div>
@@ -182,6 +186,7 @@ h3{font-size:.98rem;margin-bottom:12px}
   </section>
 
   <section id="vue-dashboard" style="display:none">
+    <div class="carte vide" id="bandeauVide" style="display:none">Importez des fichiers .fit (glisser-déposer, bouton Parcourir, ou dossier / montre) pour voir vos statistiques ici.</div>
     <div class="kpi-grid" id="kpiGrid"></div>
     <div class="carte">
       <h3 id="titreGraphique">Graphique</h3>
@@ -864,6 +869,123 @@ function initUI() {
     sel.value = state.metrique;
   }
 
+  /* ---------- Étape 6 : dossiers & synchro montre -> PC (File System Access API) ---------- */
+
+  function idbOpen() {
+    return new Promise((res, rej) => {
+      const rq = indexedDB.open('garmin-dashboard', 1);
+      rq.onupgradeneeded = () => rq.result.createObjectStore('handles');
+      rq.onsuccess = () => res(rq.result);
+      rq.onerror = () => rej(rq.error);
+    });
+  }
+  async function saveHandle(key, handle) {
+    try { const db = await idbOpen(); await new Promise((res, rej) => { const tx = db.transaction('handles', 'readwrite'); tx.objectStore('handles').put(handle, key); tx.oncomplete = res; tx.onerror = () => rej(tx.error); }); } catch (e) { /* stockage indisponible : on redemandera le dossier */ }
+  }
+  async function loadHandle(key) {
+    try { const db = await idbOpen(); return await new Promise((res, rej) => { const tx = db.transaction('handles', 'readonly'); const rq = tx.objectStore('handles').get(key); rq.onsuccess = () => res(rq.result || null); rq.onerror = () => rej(rq.error); }); } catch (e) { return null; }
+  }
+  /* Retourne un handle de dossier persistant (permission re-validée si besoin). */
+  async function getDirHandle(key, mode) {
+    if (!window.showDirectoryPicker) return null;
+    const opts = { id: key, mode };
+    let h = await loadHandle(key);
+    if (h) {
+      if (await h.queryPermission(opts) === 'granted') return h;
+      if (await h.requestPermission(opts) === 'granted') return h;
+    }
+    h = await window.showDirectoryPicker(opts);
+    await saveHandle(key, h);
+    return h;
+  }
+
+  /* Liste récursive des .fit d'un dossier (ignore les dossiers cachés). */
+  async function listFitFiles(dirHandle, prefix, out) {
+    for await (const [name, handle] of dirHandle.entries()) {
+      if (name.startsWith('.')) continue;
+      if (handle.kind === 'directory') await listFitFiles(handle, prefix + name + '/', out);
+      else if (name.toLowerCase().endsWith('.fit')) out.push({ rel: prefix + name, handle });
+    }
+  }
+
+  async function importFitEntry(entry, name) {
+    try {
+      const file = await entry.handle.getFile();
+      const buf = await file.arrayBuffer();
+      store.addFile(name, file.size, new FitParser().parse(buf), null);
+    } catch (err) {
+      store.addFile(name, 0, null, err.message);
+    }
+  }
+
+  $('btnDossier').addEventListener('click', async () => {
+    $('syncRapport').textContent = '';
+    if (window.showDirectoryPicker) {
+      let dir;
+      try { dir = await getDirHandle('garmin-data', 'read'); } catch (e) { return; }
+      if (!dir) { $('syncRapport').textContent = 'API File System Access indisponible : utilisez le sélecteur de dossier classique.'; $('dirInput').click(); return; }
+      const entries = [];
+      await listFitFiles(dir, '', entries);
+      $('syncRapport').textContent = entries.length + ' fichier(s) .fit trouvés dans le dossier — import en cours…';
+      for (const e of entries) await importFitEntry(e, e.rel);
+      render();
+      $('syncRapport').textContent = entries.length + ' fichier(s) importé(s) depuis le dossier (' + store.okCount + ' décodés au total).';
+    } else {
+      $('dirInput').click();
+    }
+  });
+  $('dirInput').addEventListener('change', async e => {
+    const files = Array.from(e.target.files).filter(f => f.name.toLowerCase().endsWith('.fit'));
+    e.target.value = '';
+    for (const f of files) {
+      try { store.addFile(f.webkitRelativePath || f.name, f.size, new FitParser().parse(await f.arrayBuffer()), null); }
+      catch (err) { store.addFile(f.webkitRelativePath || f.name, f.size, null, err.message); }
+    }
+    render();
+    $('syncRapport').textContent = files.length + ' fichier(s) importé(s) depuis le dossier.';
+  });
+
+  $('btnSync').addEventListener('click', async () => {
+    const rapport = $('syncRapport');
+    rapport.textContent = '';
+    if (!window.showDirectoryPicker) { rapport.innerHTML = '<span class="err">La synchro de dossiers nécessite un navigateur récent (File System Access API). Utilisez "Sélectionner un dossier…" ou le glisser-déposer.</span>'; return; }
+    let srcDir, dstDir;
+    try { srcDir = await getDirHandle('garmin-src', 'read'); } catch (e) { return; }
+    try { dstDir = await getDirHandle('garmin-dst', 'readwrite'); } catch (e) { return; }
+    if (!srcDir || !dstDir) return;
+    rapport.textContent = 'Lecture du dossier de la montre…';
+    const entries = [];
+    await listFitFiles(srcDir, '', entries);
+    let copies = 0, ignores = 0, erreurs = 0;
+    for (const e of entries) {
+      const base = e.rel.split('/').pop();
+      try {
+        const srcFile = await e.handle.getFile();
+        let ignore = false;
+        try {
+          const dstH = await dstDir.getFileHandle(base);
+          const dstFile = await dstH.getFile();
+          if (dstFile.size === srcFile.size) ignore = true;
+        } catch (err) { /* n'existe pas encore */ }
+        if (ignore) { ignores++; continue; }
+        const parts = e.rel.split('/');
+        let dir = dstDir;
+        for (let i = 0; i < parts.length - 1; i++) dir = await dir.getDirectoryHandle(parts[i], { create: true });
+        const dstH = await dir.getFileHandle(base, { create: true });
+        const w = await dstH.createWritable();
+        await w.write(await srcFile.arrayBuffer());
+        await w.close();
+        copies++;
+        store.addFile(e.rel, srcFile.size, new FitParser().parse(await srcFile.arrayBuffer()), null);
+      } catch (err) {
+        erreurs++;
+        store.addFile(e.rel, 0, null, err.message);
+      }
+    }
+    render();
+    rapport.innerHTML = 'Synchro terminée : <b>' + copies + '</b> nouveau(x) fichier(s) copié(s), ' + ignores + ' déjà présent(s), ' + erreurs + ' erreur(s) — ' + entries.length + ' .fit vus au total.';
+  });
+
   async function importFiles(fileList) {
     const files = Array.from(fileList).filter(f => f.name.toLowerCase().endsWith('.fit'));
     if (!files.length) return;
@@ -969,6 +1091,8 @@ function initUI() {
   /* ---------- Onglet Activités : KPIs + graphiques + séances ---------- */
 
   function renderDashboard() {
+    const vide = !store.records.size && !store.monitoring.size && !store.daily.size && !store.sleep.length;
+    $('bandeauVide').style.display = vide ? 'block' : 'none';
     const k = computeKPIs(store, state.metrique, state.periode);
     renderKPIs(k);
     const m = METRICS[state.metrique];
