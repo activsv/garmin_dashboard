@@ -2,6 +2,9 @@
 <!--
 ================================================================================
  GARMIN DASHBOARD — Visualiseur de fichiers FIT 100 % local
+ (État d'avancement : étapes 1-2 réalisées — parseur FIT + modèle de données
+  agrégé/dédoublonné + export/import JSON. Étapes 3-5 : vues Activités /
+  Sommeil / Santé avec KPIs et graphiques. Étape 6 : synchro montre -> PC.)
 ================================================================================
  Fichier unique et autonome : aucun serveur, aucune dépendance externe, aucune
  donnée envoyée sur le réseau. Ouvrir simplement ce fichier dans un navigateur
@@ -112,8 +115,11 @@ h3{font-size:.98rem;margin-bottom:12px}
       <p>Plusieurs fichiers acceptés (activités, monitoring, sommeil…).</p>
       <div class="boutons">
         <button class="btn" id="btnParcourir">Parcourir des fichiers .fit…</button>
+        <button class="btn secondaire" id="btnExport" title="Exporter le jeu de données agrégé en JSON">Exporter JSON</button>
+        <button class="btn secondaire" id="btnImport" title="Recharger un export JSON précédent">Importer JSON…</button>
       </div>
       <input type="file" id="fileInput" accept=".fit" multiple hidden>
+      <input type="file" id="jsonInput" accept=".json,application/json" hidden>
     </div>
   </div>
   <div id="statut"></div>
@@ -383,30 +389,142 @@ class FitParser {
 }
 
 /* ============================================================================
-   COUCHE 2 — DataStore : agrégation des fichiers importés (dédouillonage par
-   timestamp à venir avec les séries chronologiques ; étape 1 = inventaire).
+   COUCHE 2 — DataStore : agrège tous les fichiers importés en un jeu de
+   données chronologique unique. Dédouillonage : les records sont indexés par
+   timestamp (ms) et fusionnés champ par champ ; les sessions par (début, sport).
    ========================================================================== */
+function fitTimestampMs(m, rawField) {
+  const v = m.raw[rawField];
+  if (typeof v === 'number') return FIT_EPOCH_MS + v * 1000;
+  return null;
+}
+function mergeInto(target, src) {
+  for (const k in src) if (target[k] === null || target[k] === undefined) target[k] = src[k];
+  return target;
+}
+function utcDayKey(t) { return new Date(t).toISOString().slice(0, 10); }
+
 class DataStore {
-  constructor() { this.files = []; }
-  addFile(name, size, parsed, error) {
-    this.files.push({ name, size, parsed, error, id: this.files.length });
+  constructor() {
+    this.files = [];          // {id, name, size, parsed, error}
+    this.records = new Map(); // t(ms) -> point aplati (record à la seconde)
+    this.sessions = [];       // sessions aplaties, dédoublonnées
+    this._sessionKeys = new Set();
+    this.laps = [];
+    this.daily = new Map();   // 'YYYY-MM-DD' (UTC) -> agrégat monitoring_daily
+    this.sleep = [];          // messages sleep aplatis
+    this.other = {};          // autres types de messages (debug)
   }
+
+  addFile(name, size, parsed, error) {
+    const entry = { name, size, parsed, error, id: this.files.length };
+    this.files.push(entry);
+    if (!error && parsed) this._ingest(parsed);
+    return entry;
+  }
+
+  _ingest(parsed) {
+    for (const m of parsed.messages) {
+      if (m.name === 'record') {
+        const t = fitTimestampMs(m, 'f253') ?? (m.fields.timestamp ? Date.parse(m.fields.timestamp) : null);
+        if (t === null || Number.isNaN(t)) continue;
+        const p = Object.assign({}, m.fields);
+        delete p.timestamp;
+        p.t = t;
+        const ex = this.records.get(t);
+        this.records.set(t, ex ? mergeInto(ex, p) : p);
+      } else if (m.name === 'session') {
+        const start = fitTimestampMs(m, 'f2') ?? (m.fields.start_time ? Date.parse(m.fields.start_time) : null);
+        const key = start + '|' + (m.fields.sport ?? '?');
+        if (this._sessionKeys.has(key)) continue;
+        this._sessionKeys.add(key);
+        const s = Object.assign({}, m.fields);
+        if (start !== null) s.startMs = start;
+        const t = fitTimestampMs(m, 'f253');
+        if (t !== null) s.t = t;
+        this.sessions.push(s);
+      } else if (m.name === 'lap') {
+        this.laps.push(Object.assign({}, m.fields));
+      } else if (m.name === 'monitoring_daily') {
+        const t = fitTimestampMs(m, 'f253');
+        if (t === null) continue;
+        const d = utcDayKey(t);
+        const cur = this.daily.get(d) || { date: d };
+        mergeInto(cur, m.fields);
+        delete cur.timestamp;
+        this.daily.set(d, cur);
+      } else if (m.name === 'sleep') {
+        this.sleep.push(Object.assign({}, m.fields));
+      } else {
+        (this.other[m.name] = this.other[m.name] || []).push(m.fields);
+      }
+    }
+  }
+
+  recordsSorted() { return Array.from(this.records.values()).sort((a, b) => a.t - b.t); }
   get okCount() { return this.files.filter(f => !f.error).length; }
+
+  exportJSON() {
+    return JSON.stringify({
+      format: 'garmin-dashboard', version: 1, exportedAt: new Date().toISOString(),
+      files: this.files.map(f => ({ name: f.name, size: f.size, error: f.error || null })),
+      records: this.recordsSorted(), sessions: this.sessions, laps: this.laps,
+      daily: Array.from(this.daily.values()), sleep: this.sleep, other: this.other,
+    });
+  }
+
+  static fromJSON(text) {
+    const data = JSON.parse(text);
+    if (!data || data.format !== 'garmin-dashboard') throw new Error('Ce fichier n\'est pas un export de ce dashboard.');
+    const st = new DataStore();
+    st.files = (data.files || []).map((f, i) => ({ ...f, parsed: null, error: f.error, id: i }));
+    for (const r of data.records || []) st.records.set(r.t, r);
+    st.sessions = data.sessions || [];
+    st._sessionKeys = new Set(st.sessions.map(s => (s.startMs ?? '') + '|' + (s.sport ?? '?')));
+    st.laps = data.laps || [];
+    for (const d of data.daily || []) st.daily.set(d.date, d);
+    st.sleep = data.sleep || [];
+    st.other = data.other || {};
+    return st;
+  }
 }
 
 /* ============================================================================
    COUCHE 3 — UI (navigateur uniquement)
    ========================================================================== */
 function initUI() {
-  const store = new DataStore();
+  let store = new DataStore();
   let fichierSel = null;
 
   const $ = id => document.getElementById(id);
-  const dropZone = $('dropZone'), fileInput = $('fileInput');
+  const dropZone = $('dropZone'), fileInput = $('fileInput'), jsonInput = $('jsonInput');
 
   $('btnParcourir').addEventListener('click', e => { e.stopPropagation(); fileInput.click(); });
   dropZone.addEventListener('click', () => fileInput.click());
   fileInput.addEventListener('change', () => { importFiles(fileInput.files); fileInput.value = ''; });
+  $('btnExport').addEventListener('click', () => {
+    if (!store.files.length) { $('statut').innerHTML = '<span class="err">Aucune donnée à exporter.</span>'; return; }
+    const blob = new Blob([store.exportJSON()], { type: 'application/json' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'garmin-dashboard-data.json';
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+  });
+  $('btnImport').addEventListener('click', () => jsonInput.click());
+  jsonInput.addEventListener('change', async e => {
+    const f = e.target.files[0];
+    e.target.value = '';
+    if (!f) return;
+    try {
+      store = DataStore.fromJSON(await f.text());
+      fichierSel = null;
+      render();
+      $('statut').innerHTML = 'Jeu de données importé depuis <b>' + esc(f.name) + '</b> — ' + store.records.size + ' points, ' + store.sessions.length + ' séance(s).';
+    } catch (err) {
+      $('statut').innerHTML = '<span class="err">Import JSON impossible : ' + esc(err.message) + '</span>';
+    }
+  });
   ['dragenter', 'dragover'].forEach(ev => dropZone.addEventListener(ev, e => { e.preventDefault(); dropZone.classList.add('over'); }));
   ['dragleave', 'drop'].forEach(ev => dropZone.addEventListener(ev, e => { e.preventDefault(); dropZone.classList.remove('over'); }));
   dropZone.addEventListener('drop', e => importFiles(e.dataTransfer.files));
@@ -456,7 +574,7 @@ function initUI() {
   function renderDetail() {
     const f = store.files.find(x => x.id === fichierSel);
     const carte = $('detailFichier');
-    if (!f || f.error) { carte.style.display = 'none'; return; }
+    if (!f || f.error || !f.parsed) { carte.style.display = 'none'; return; }
     carte.style.display = 'block';
     $('detailTitre').textContent = f.name;
     const fid = f.parsed.messages.find(m => m.name === 'file_id');
