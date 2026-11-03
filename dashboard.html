@@ -1,0 +1,516 @@
+<!DOCTYPE html>
+<!--
+================================================================================
+ GARMIN DASHBOARD — Visualiseur de fichiers FIT 100 % local
+================================================================================
+ Fichier unique et autonome : aucun serveur, aucune dépendance externe, aucune
+ donnée envoyée sur le réseau. Ouvrir simplement ce fichier dans un navigateur
+ (double-clic), puis glisser-déposer des fichiers .fit Garmin.
+
+ ARCHITECTURE DU FICHIER (3 couches, en vanilla JS, dans l'ordre) :
+   1. FitParser  : décode le binaire FIT (header, CRC, messages de définition,
+                   records) en objets JavaScript. Aucune dépendance.
+   2. DataStore  : agrège les fichiers importés en un jeu de données
+                   chronologique unique (dédouillonage par timestamp).
+   3. UI         : onglets, KPIs, graphiques Canvas (dessinés à la main :
+                   axes, courbe, moyenne glissante, seuils, zoom, tooltips).
+
+--------------------------------------------------------------------------------
+ COMMENT AJOUTER UNE NOUVELLE MÉTRIQUE (ex. SpO2, stress, température...)
+--------------------------------------------------------------------------------
+  1. Dans FIELD_DEFS (couche 1), déclarer le champ du message FIT concerné :
+        record: { 13: {name:'temperature', unit:'°C'} }   // champ brut du .fit
+     avec éventuellement scale/offset (ex. scale:5, offset:500 pour altitude)
+     ou convert:'semicircles' / 'timestamp' pour les conversions standard.
+  2. Dans METRICS (couche 3), ajouter une entrée :
+        spo2: { label:'SpO2', unit:'%', color:'#8b5cf6', source:'record',
+                field:'spo2', decimals:0 }
+     - source 'record'  : série à la seconde (graphique zoomable par séance)
+     - source 'daily'   : valeur journalière (graphique par jour)
+     - field fait le lien avec le nom de champ aplati produit par DataStore.
+  3. DataStore aplatit automatiquement les champs connus de chaque message ;
+     aucune autre modification n'est nécessaire : les KPIs, le sélecteur de
+     métrique, le graphique principal, le zoom et le tableau utilisent METRICS.
+  4. (Optionnel) ajouter des seuils par défaut dans DEFAULT_THRESHOLDS.
+================================================================================
+-->
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Garmin Dashboard — FIT local</title>
+<style>
+:root{
+  --fond:#f1f5f9; --carte:#ffffff; --bord:#e2e8f0; --texte:#0f172a; --texte2:#64748b;
+  --primaire:#2563eb; --primaire-f:#1d4ed8; --ok:#059669; --ok-fond:#d1fae5;
+  --warn:#d97706; --warn-fond:#fef3c7; --err:#dc2626; --err-fond:#fee2e2;
+  --ombre:0 1px 3px rgba(15,23,42,.08); --rayon:10px;
+}
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  background:var(--fond);color:var(--texte);line-height:1.5;min-height:100vh}
+header{background:var(--carte);border-bottom:1px solid var(--bord);padding:14px 24px;
+  position:sticky;top:0;z-index:50;box-shadow:var(--ombre)}
+header h1{font-size:1.25rem;font-weight:700;color:var(--primaire)}
+header p{font-size:.82rem;color:var(--texte2)}
+.wrap{max-width:1400px;margin:0 auto;padding:20px 24px 60px}
+.carte{background:var(--carte);border:1px solid var(--bord);border-radius:var(--rayon);
+  box-shadow:var(--ombre);padding:20px;margin-bottom:20px}
+#dropZone{border:2px dashed var(--bord);border-radius:var(--rayon);padding:36px 20px;
+  text-align:center;cursor:pointer;transition:border-color .2s,background .2s;background:#f8fafc}
+#dropZone:hover,#dropZone.over{border-color:var(--primaire);background:#eff6ff}
+#dropZone .icone{font-size:2.4rem}
+#dropZone h2{font-size:1.05rem;margin:8px 0 4px}
+#dropZone p{font-size:.85rem;color:var(--texte2)}
+.boutons{display:flex;gap:10px;justify-content:center;margin-top:14px;flex-wrap:wrap}
+.btn{padding:9px 18px;border:none;border-radius:8px;font-size:.9rem;font-weight:600;cursor:pointer;
+  background:var(--primaire);color:#fff;transition:background .15s}
+.btn:hover{background:var(--primaire-f)}
+.btn.secondaire{background:#e2e8f0;color:var(--texte)}
+.btn.secondaire:hover{background:#cbd5e1}
+#statut{font-size:.85rem;color:var(--texte2);margin-bottom:16px;min-height:1.2em}
+#statut .err{color:var(--err);font-weight:600}
+.onglets{display:flex;gap:4px;border-bottom:1px solid var(--bord);margin-bottom:20px;flex-wrap:wrap}
+.onglet{padding:10px 18px;border:none;background:none;font-size:.92rem;font-weight:600;color:var(--texte2);
+  cursor:pointer;border-bottom:2px solid transparent}
+.onglet:hover{color:var(--texte)}
+.onglet.actif{color:var(--primaire);border-bottom-color:var(--primaire)}
+.onglet.inactif{opacity:.45;cursor:not-allowed}
+table{border-collapse:collapse;width:100%;font-size:.85rem}
+th,td{padding:8px 10px;text-align:left;border-bottom:1px solid var(--bord);white-space:nowrap}
+th{font-size:.75rem;text-transform:uppercase;letter-spacing:.04em;color:var(--texte2);background:#f8fafc;
+  position:sticky;top:0}
+tbody tr:hover{background:#f8fafc}
+.badge{display:inline-block;padding:3px 10px;border-radius:999px;font-size:.75rem;font-weight:600}
+.badge.ok{background:var(--ok-fond);color:var(--ok)}
+.badge.warn{background:var(--warn-fond);color:var(--warn)}
+.badge.err{background:var(--err-fond);color:var(--err)}
+.liste-fichiers{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:12px;margin-bottom:20px}
+.fichier{border:1px solid var(--bord);border-radius:8px;padding:12px 14px;cursor:pointer;background:#fff}
+.fichier:hover{border-color:var(--primaire)}
+.fichier.sel{border-color:var(--primaire);box-shadow:0 0 0 1px var(--primaire)}
+.fichier .nom{font-weight:600;font-size:.9rem;word-break:break-all}
+.fichier .meta{font-size:.78rem;color:var(--texte2);margin-top:4px}
+.fichier .meta .err{color:var(--err)}
+select{padding:7px 10px;border:1px solid var(--bord);border-radius:8px;font-size:.85rem;background:#fff}
+.petit{font-size:.78rem;color:var(--texte2)}
+.zone-scroll{max-height:420px;overflow:auto;border:1px solid var(--bord);border-radius:8px}
+.vide{text-align:center;color:var(--texte2);padding:40px 20px;font-size:.9rem}
+h3{font-size:.98rem;margin-bottom:12px}
+</style>
+</head>
+<body>
+<header>
+  <h1>Garmin Dashboard</h1>
+  <p>Visualiseur de fichiers .fit — 100 % local et hors-ligne : vos données ne quittent jamais ce navigateur.</p>
+</header>
+<div class="wrap">
+  <div class="carte" id="zoneImport">
+    <div id="dropZone">
+      <div class="icone">⌚</div>
+      <h2>Glissez-déposez vos fichiers .fit ici</h2>
+      <p>Plusieurs fichiers acceptés (activités, monitoring, sommeil…).</p>
+      <div class="boutons">
+        <button class="btn" id="btnParcourir">Parcourir des fichiers .fit…</button>
+      </div>
+      <input type="file" id="fileInput" accept=".fit" multiple hidden>
+    </div>
+  </div>
+  <div id="statut"></div>
+  <nav class="onglets" id="onglets">
+    <button class="onglet actif" data-vue="fichiers">Fichiers &amp; données</button>
+    <button class="onglet inactif" data-vue="activites" title="Étape 3">Activités</button>
+    <button class="onglet inactif" data-vue="sommeil" title="Étape 4">Sommeil</button>
+    <button class="onglet inactif" data-vue="sante" title="Étape 4">Santé</button>
+  </nav>
+
+  <section id="vue-fichiers">
+    <div class="liste-fichiers" id="listeFichiers"></div>
+    <div class="carte" id="detailFichier" style="display:none">
+      <h3 id="detailTitre">Détail du fichier</h3>
+      <div id="detailMeta" class="petit" style="margin-bottom:12px"></div>
+      <div style="margin-bottom:10px">
+        <label class="petit" for="selMessage">Type de message :</label>
+        <select id="selMessage"></select>
+      </div>
+      <div class="zone-scroll"><table id="tableMessages"><thead></thead><tbody></tbody></table></div>
+    </div>
+    <div class="carte vide" id="aucunFichier">Aucun fichier importé pour le moment.</div>
+  </section>
+</div>
+
+<script>
+'use strict';
+/* ============================================================================
+   COUCHE 1 — FitParser : binaire FIT -> objets JS
+   Spécification : header (12 ou 14 octets), puis messages. Un message =
+   1 octet d'en-tête (bit 6 = définition, bit 5 = données développeur,
+   bits 0-3 = n° local) suivi du corps. CRC-16 (poly 0x1021, init 0, MSB first).
+   ========================================================================== */
+
+const FIT_EPOCH_MS = Date.UTC(1989, 11, 31, 0, 0, 0); // 1989-12-31T00:00:00Z
+
+const BASE_TYPES = {
+  0x00:{name:'uint8',  size:1, invalid:0xFF},
+  0x01:{name:'sint8',  size:1, invalid:0x7F},
+  0x02:{name:'uint16', size:2, invalid:0xFFFF},
+  0x83:{name:'sint16', size:2, invalid:0x7FFF},
+  0x84:{name:'uint32', size:4, invalid:0xFFFFFFFF},
+  0x85:{name:'sint32', size:4, invalid:0x7FFFFFFF},
+  0x86:{name:'string', size:1, invalid:-1},
+  0x87:{name:'float32',size:4, invalid:0xFFFFFFFF},
+  0x88:{name:'float64',size:8, invalid:-1},
+  0x89:{name:'byte',   size:1, invalid:-1},
+  0x8A:{name:'uint16z',size:2, invalid:0},
+  0x8B:{name:'uint32z',size:4, invalid:0},
+  0x8C:{name:'sint8z', size:1, invalid:0x80},
+  0x8D:{name:'sint16z',size:2, invalid:0x8000},
+  0x8E:{name:'sint32z',size:4, invalid:0x80000000},
+};
+
+const GLOBAL_MESSAGES = {
+  0:'file_id', 1:'capabilities', 2:'device_settings', 3:'user_profile',
+  4:'hrm_profile', 5:'sdm_profile', 6:'bike_profile', 7:'zones_target',
+  8:'hr_zone', 9:'power_zone', 10:'met_zone', 11:'sport', 12:'goal',
+  18:'event', 19:'device_info', 20:'record', 21:'lap', 22:'session',
+  23:'activity', 24:'software', 26:'workout', 27:'workout_step', 28:'schedule',
+  30:'weight_scale', 31:'course', 32:'course_point', 33:'totals',
+  34:'activity_summary', 35:'monitoring_daily', 39:'sleep', 40:'gps_metadata',
+  49:'file_creator', 73:'monitoring', 78:'hrv', 82:'record_dev',
+};
+
+/* Champs connus des messages usuels : nom lisible, unité, scale/offset,
+   conversion spéciale. Tout champ non listé reste affiché en brut (fN). */
+const FIELD_DEFS = {
+  file_id: { 0:{name:'type'}, 1:{name:'manufacturer'}, 2:{name:'product'},
+             3:{name:'serial_number'}, 4:{name:'time_created', convert:'timestamp'},
+             5:{name:'number'}, 8:{name:'product_name'} },
+  record: {
+    253:{name:'timestamp', convert:'timestamp'},
+    0:{name:'position_lat', convert:'semicircles', unit:'°'},
+    1:{name:'position_long', convert:'semicircles', unit:'°'},
+    2:{name:'altitude', scale:5, offset:500, unit:'m'},
+    39:{name:'enhanced_altitude', scale:5, offset:500, unit:'m'},
+    3:{name:'heart_rate', unit:'bpm'},
+    4:{name:'cadence', unit:'tr/min'},
+    5:{name:'distance', scale:100, unit:'m'},
+    6:{name:'speed', scale:1000, unit:'m/s'},
+    73:{name:'enhanced_speed', scale:1000, unit:'m/s'},
+    7:{name:'power', unit:'W'},
+    13:{name:'temperature', unit:'°C'},
+  },
+  lap: {
+    254:{name:'message_index'}, 253:{name:'timestamp', convert:'timestamp'},
+    2:{name:'start_time', convert:'timestamp'}, 5:{name:'sport'},
+    7:{name:'total_elapsed_time', scale:1000, unit:'s'},
+    8:{name:'total_timer_time', scale:1000, unit:'s'},
+    9:{name:'total_distance', scale:100, unit:'m'},
+    11:{name:'total_calories', unit:'kcal'},
+    15:{name:'avg_heart_rate', unit:'bpm'}, 16:{name:'max_heart_rate', unit:'bpm'},
+    25:{name:'avg_speed', scale:1000, unit:'m/s'}, 26:{name:'max_speed', scale:1000, unit:'m/s'},
+    34:{name:'avg_cadence', unit:'tr/min'}, 35:{name:'max_cadence', unit:'tr/min'},
+  },
+  session: {
+    254:{name:'message_index'}, 253:{name:'timestamp', convert:'timestamp'},
+    2:{name:'start_time', convert:'timestamp'}, 5:{name:'sport'}, 6:{name:'sub_sport'},
+    7:{name:'total_elapsed_time', scale:1000, unit:'s'},
+    8:{name:'total_timer_time', scale:1000, unit:'s'},
+    9:{name:'total_distance', scale:100, unit:'m'},
+    11:{name:'total_calories', unit:'kcal'},
+    14:{name:'avg_speed', scale:1000, unit:'m/s'}, 15:{name:'max_speed', scale:1000, unit:'m/s'},
+    16:{name:'avg_heart_rate', unit:'bpm'}, 17:{name:'max_heart_rate', unit:'bpm'},
+    18:{name:'avg_cadence', unit:'tr/min'}, 19:{name:'max_cadence', unit:'tr/min'},
+    25:{name:'total_ascent', unit:'m'}, 26:{name:'total_descent', unit:'m'},
+  },
+  activity: { 253:{name:'timestamp', convert:'timestamp'}, 3:{name:'time_created', convert:'timestamp'} },
+  monitoring_daily: { 253:{name:'timestamp', convert:'timestamp'} },
+  sleep: { 253:{name:'timestamp', convert:'timestamp'} },
+  event: { 253:{name:'timestamp', convert:'timestamp'}, 0:{name:'event'}, 1:{name:'event_type'} },
+  device_info: { 253:{name:'timestamp', convert:'timestamp'}, 1:{name:'manufacturer'}, 2:{name:'product'} },
+};
+
+const CRC_TABLE = (() => {
+  const t = new Uint16Array(256);
+  for (let i = 0; i < 256; i++) {
+    let c = i << 8;
+    for (let j = 0; j < 8; j++) c = (c & 0x8000) ? ((c << 1) ^ 0x1021) : (c << 1);
+    t[i] = c & 0xFFFF;
+  }
+  return t;
+})();
+
+function fitCrc16(bytes, start, end) {
+  let crc = 0;
+  for (let i = start; i < end; i++)
+    crc = ((crc << 8) & 0xFFFF) ^ CRC_TABLE[((crc >> 8) ^ bytes[i]) & 0xFF];
+  return crc & 0xFFFF;
+}
+
+class FitParser {
+  /* Retourne { header, messages:[{type, name, fields:{}, raw:{}}], warnings:[] }
+     ou lève une Error avec un message clair si le fichier n'est pas un FIT. */
+  parse(arrayBuffer) {
+    const bytes = new Uint8Array(arrayBuffer);
+    const dv = new DataView(arrayBuffer);
+    if (bytes.length < 12) throw new Error('Fichier trop petit (< 12 octets) : ce n\'est pas un .fit valide.');
+    const hdrSize = dv.getUint8(0);
+    if (hdrSize !== 12 && hdrSize !== 14) throw new Error('Taille d\'en-tête invalide (' + hdrSize + ') : fichier corrompu ou non standard.');
+    const protocol = dv.getUint8(1);
+    const profile = dv.getUint16(2, true);
+    const dataSize = dv.getUint32(4, true);
+    const magic = String.fromCharCode(bytes[8], bytes[9], bytes[10], bytes[11]);
+    if (magic !== '.FIT') throw new Error('Signature ".FIT" absente : ce n\'est pas un fichier FIT.');
+    if (14 + dataSize + 2 > bytes.length)
+      throw new Error('Taille déclarée (' + dataSize + ' octets) supérieure au contenu du fichier : fichier tronqué.');
+
+    const warnings = [];
+    if (hdrSize === 14) {
+      const hdrCrcStored = dv.getUint16(12, true);
+      const hdrCrcCalc = fitCrc16(bytes, 0, hdrSize - 2);
+      if (hdrCrcStored !== hdrCrcCalc) warnings.push('CRC de l\'en-tête invalide (attendu 0x' + hdrCrcStored.toString(16) + ', calculé 0x' + hdrCrcCalc.toString(16) + ') — décodage poursuivi.');
+    }
+    const fileCrcStored = dv.getUint16(14 + dataSize, true);
+    const fileCrcCalc = fitCrc16(bytes, 0, 14 + dataSize);
+    if (fileCrcStored !== fileCrcCalc) warnings.push('CRC du fichier invalide (attendu 0x' + fileCrcStored.toString(16) + ', calculé 0x' + fileCrcCalc.toString(16) + ') — décodage poursuivi malgré tout.');
+
+    const header = { size: hdrSize, protocol, profile, dataSize, crcOk: fileCrcStored === fileCrcCalc };
+    const messages = [];
+    const defs = new Map();
+    let pos = hdrSize;
+    const end = hdrSize + dataSize;
+
+    while (pos < end) {
+      const h = dv.getUint8(pos);
+      const isDef = (h & 0x40) !== 0;
+      const hasDev = (h & 0x20) !== 0;
+      const local = h & 0x0F;
+      if (isDef) {
+        if (pos + 6 > end) throw new Error('Message de définition tronqué à l\'offset ' + pos + '.');
+        const arch = dv.getUint8(pos + 2);
+        const gmn = dv.getUint16(pos + 3, arch === 0);
+        const numFields = dv.getUint8(pos + 5);
+        let p = pos + 6;
+        if (p + numFields * 3 > end) throw new Error('Message de définition tronqué à l\'offset ' + pos + '.');
+        const fields = [];
+        for (let i = 0; i < numFields; i++) {
+          fields.push({ num: dv.getUint8(p), size: dv.getUint8(p + 1), type: dv.getUint8(p + 2) });
+          p += 3;
+        }
+        if (hasDev) {
+          if (p >= end) throw new Error('Message de définition développeur tronqué à l\'offset ' + pos + '.');
+          const numDev = dv.getUint8(p); p++;
+          if (p + numDev * 3 > end) throw new Error('Message de définition développeur tronqué à l\'offset ' + pos + '.');
+          for (let i = 0; i < numDev; i++) {
+            fields.push({ num: dv.getUint8(p), size: dv.getUint8(p + 1), type: dv.getUint8(p + 2), dev: true });
+            p += 3;
+          }
+        }
+        let dataLen = 0;
+        for (const f of fields) dataLen += f.size;
+        defs.set(local, { gmn, arch, fields, dataLen });
+        pos = p;
+      } else {
+        const def = defs.get(local);
+        if (!def) throw new Error('Message de données sans définition préalable (n° local ' + local + ', offset ' + pos + ') : fichier corrompu.');
+        if (pos + 1 + def.dataLen > end) throw new Error('Message de données tronqué à l\'offset ' + pos + '.');
+        const name = GLOBAL_MESSAGES[def.gmn] || ('message_' + def.gmn);
+        const { fields, raw } = this._decodeFields(dv, pos + 1, def);
+        messages.push({ type: def.gmn, name, fields, raw, offset: pos });
+        pos += 1 + def.dataLen;
+      }
+    }
+    return { header, messages, warnings };
+  }
+
+  _readScalar(dv, q, type, le, byteLen) {
+    let v;
+    switch (type) {
+      case 0x00: case 0x89: v = dv.getUint8(q); break;
+      case 0x01: case 0x8C: v = dv.getInt8(q); break;
+      case 0x02: case 0x8A: v = byteLen === 1 ? dv.getUint8(q) : dv.getUint16(q, le); break;
+      case 0x83: case 0x8D: v = byteLen === 1 ? dv.getInt8(q) : dv.getInt16(q, le); break;
+      case 0x84: case 0x8B: v = byteLen === 1 ? dv.getUint8(q) : byteLen === 2 ? dv.getUint16(q, le) : dv.getUint32(q, le); break;
+      case 0x85: case 0x8E: v = byteLen === 1 ? dv.getInt8(q) : byteLen === 2 ? dv.getInt16(q, le) : dv.getInt32(q, le); break;
+      case 0x87: v = dv.getFloat32(q, le); break;
+      case 0x88: v = dv.getFloat64(q, le); break;
+      default: return null;
+    }
+    const bt = BASE_TYPES[type];
+    if (bt && bt.invalid !== -1 && v === bt.invalid) return null;
+    return v;
+  }
+
+  _decodeFields(dv, start, def) {
+    const le = def.arch === 0;
+    const fieldDefs = FIELD_DEFS[GLOBAL_MESSAGES[def.gmn] || ''] || {};
+    const fields = {};
+    const raw = {};
+    let p = start;
+    for (const f of def.fields) {
+      const bt = BASE_TYPES[f.type];
+      if (!bt) { raw['f' + f.num] = '<type inconnu 0x' + f.type.toString(16) + '>'; p += f.size; continue; }
+      if (f.type === 0x86) { // string
+        let s = '';
+        for (let i = 0; i < f.size; i++) { const c = dv.getUint8(p + i); if (c === 0) break; s += String.fromCharCode(c); }
+        raw['f' + f.num] = s;
+        p += f.size;
+        continue;
+      }
+      const count = Math.floor(f.size / bt.size);
+      const vals = [];
+      if (count >= 1) {
+        for (let i = 0; i < count; i++) vals.push(this._readScalar(dv, p + i * bt.size, f.type, le, bt.size));
+      } else {
+        // Champ déclaré plus petit que son type : on lit sur f.size octets.
+        vals.push(this._readScalar(dv, p, f.type, le, f.size));
+      }
+      const val = count === 1 ? vals[0] : (count === 0 ? vals[0] : vals);
+      raw['f' + f.num] = val;
+      const fd = fieldDefs[f.num];
+      if (fd) {
+        let out = val;
+        if (val !== null && !Array.isArray(val)) {
+          if (fd.convert === 'timestamp' && typeof val === 'number') out = new Date(FIT_EPOCH_MS + val * 1000).toISOString();
+          else if (fd.convert === 'semicircles' && typeof val === 'number') out = val * (180 / 2147483648);
+          else if (fd.scale) out = val / fd.scale + (fd.offset || 0);
+        }
+        fields[fd.name] = out;
+      }
+      p += f.size;
+    }
+    return { fields, raw };
+  }
+}
+
+/* ============================================================================
+   COUCHE 2 — DataStore : agrégation des fichiers importés (dédouillonage par
+   timestamp à venir avec les séries chronologiques ; étape 1 = inventaire).
+   ========================================================================== */
+class DataStore {
+  constructor() { this.files = []; }
+  addFile(name, size, parsed, error) {
+    this.files.push({ name, size, parsed, error, id: this.files.length });
+  }
+  get okCount() { return this.files.filter(f => !f.error).length; }
+}
+
+/* ============================================================================
+   COUCHE 3 — UI (navigateur uniquement)
+   ========================================================================== */
+function initUI() {
+  const store = new DataStore();
+  let fichierSel = null;
+
+  const $ = id => document.getElementById(id);
+  const dropZone = $('dropZone'), fileInput = $('fileInput');
+
+  $('btnParcourir').addEventListener('click', e => { e.stopPropagation(); fileInput.click(); });
+  dropZone.addEventListener('click', () => fileInput.click());
+  fileInput.addEventListener('change', () => { importFiles(fileInput.files); fileInput.value = ''; });
+  ['dragenter', 'dragover'].forEach(ev => dropZone.addEventListener(ev, e => { e.preventDefault(); dropZone.classList.add('over'); }));
+  ['dragleave', 'drop'].forEach(ev => dropZone.addEventListener(ev, e => { e.preventDefault(); dropZone.classList.remove('over'); }));
+  dropZone.addEventListener('drop', e => importFiles(e.dataTransfer.files));
+
+  async function importFiles(fileList) {
+    const files = Array.from(fileList).filter(f => f.name.toLowerCase().endsWith('.fit'));
+    if (!files.length) return;
+    for (const f of files) {
+      try {
+        const buf = await f.arrayBuffer();
+        const parsed = new FitParser().parse(buf);
+        store.addFile(f.name, f.size, parsed, null);
+      } catch (err) {
+        store.addFile(f.name, f.size, null, err.message);
+      }
+    }
+    render();
+  }
+
+  function render() {
+    const st = $('statut');
+    const errs = store.files.filter(f => f.error);
+    st.innerHTML = store.files.length
+      ? store.files.length + ' fichier(s) — <b>' + store.okCount + '</b> décodé(s), <span class="err">' + errs.length + ' en erreur</span>'
+      : '';
+    $('aucunFichier').style.display = store.files.length ? 'none' : 'block';
+    const liste = $('listeFichiers');
+    liste.innerHTML = '';
+    store.files.forEach(f => {
+      const div = document.createElement('div');
+      div.className = 'fichier' + (fichierSel === f.id ? ' sel' : '');
+      const counts = f.parsed ? countMessages(f.parsed) : '';
+      div.innerHTML =
+        '<div class="nom">' + esc(f.name) + '</div>' +
+        '<div class="meta">' + fmtTaille(f.size) +
+        (f.error
+          ? ' — <span class="err">ERREUR : ' + esc(f.error) + '</span>'
+          : ' — <span class="badge ok">décodé</span> ' + counts +
+            (f.parsed.warnings.length ? ' — <span class="badge warn">' + f.parsed.warnings.length + ' avertissement(s)</span>' : '')) +
+        '</div>';
+      div.addEventListener('click', () => { fichierSel = f.id; render(); });
+      liste.appendChild(div);
+    });
+    renderDetail();
+  }
+
+  function renderDetail() {
+    const f = store.files.find(x => x.id === fichierSel);
+    const carte = $('detailFichier');
+    if (!f || f.error) { carte.style.display = 'none'; return; }
+    carte.style.display = 'block';
+    $('detailTitre').textContent = f.name;
+    const fid = f.parsed.messages.find(m => m.name === 'file_id');
+    const h = f.parsed.header;
+    $('detailMeta').innerHTML =
+      'Profil ' + h.profile + ' — protocole ' + h.protocol + ' — ' + f.parsed.messages.length + ' messages — CRC ' +
+      (h.crcOk ? '<span class="badge ok">valide</span>' : '<span class="badge warn">invalide</span>') +
+      (fid ? ' — ' + esc(JSON.stringify(fid.fields)) : '') +
+      (f.parsed.warnings.length ? '<br><span style="color:var(--warn)">' + f.parsed.warnings.map(esc).join('<br>') + '</span>' : '');
+    const sel = $('selMessage');
+    const counts = {};
+    f.parsed.messages.forEach(m => { counts[m.name] = (counts[m.name] || 0) + 1; });
+    const prev = sel.value;
+    sel.innerHTML = Object.entries(counts).map(([n, c]) => '<option value="' + esc(n) + '">' + esc(n) + ' (' + c + ')</option>').join('');
+    if (prev && counts[prev]) sel.value = prev;
+    sel.onchange = () => renderTable(f, sel.value);
+    renderTable(f, sel.value || Object.keys(counts)[0]);
+  }
+
+  function renderTable(f, name) {
+    const msgs = f.parsed.messages.filter(m => m.name === name).slice(0, 100);
+    const table = $('tableMessages');
+    if (!msgs.length) { table.innerHTML = '<tbody><tr><td class="petit">Aucun message de ce type.</td></tr></tbody>'; return; }
+    const cols = [];
+    msgs.forEach(m => { Object.keys(m.fields).forEach(k => { if (!cols.includes(k)) cols.push(k); }); Object.keys(m.raw).forEach(k => { if (!cols.includes(k)) cols.push(k); }); });
+    let html = '<thead><tr>' + cols.map(c => '<th>' + esc(c) + '</th>').join('') + '</tr></thead><tbody>';
+    msgs.forEach(m => {
+      html += '<tr>' + cols.map(c => '<td>' + esc(fmtVal(m.fields[c] !== undefined ? m.fields[c] : m.raw[c])) + '</td>').join('') + '</tr>';
+    });
+    table.innerHTML = html + '</tbody>';
+  }
+
+  function countMessages(parsed) {
+    const c = {};
+    parsed.messages.forEach(m => { c[m.name] = (c[m.name] || 0) + 1; });
+    return Object.entries(c).map(([n, k]) => n + '×' + k).join(', ');
+  }
+  function fmtTaille(o) { return o < 1024 ? o + ' o' : o < 1048576 ? (o / 1024).toFixed(1) + ' Ko' : (o / 1048576).toFixed(2) + ' Mo'; }
+  function fmtVal(v) { if (v === null || v === undefined) return '—'; if (Array.isArray(v)) return '[' + v.join(',') + ']'; if (typeof v === 'number') return Math.round(v * 1000) / 1000; return String(v); }
+  function esc(s) { return String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])); }
+
+  document.querySelectorAll('#onglets .onglet').forEach(b => b.addEventListener('click', () => {
+    if (b.classList.contains('inactif')) return;
+    document.querySelectorAll('#onglets .onglet').forEach(x => x.classList.remove('actif'));
+    b.classList.add('actif');
+  }));
+}
+
+if (typeof module !== 'undefined' && module.exports) {
+  module.exports = { FitParser, DataStore, fitCrc16, GLOBAL_MESSAGES, FIELD_DEFS, FIT_EPOCH_MS };
+}
+if (typeof document !== 'undefined') {
+  document.addEventListener('DOMContentLoaded', initUI);
+}
+</script>
+</body>
+</html>
