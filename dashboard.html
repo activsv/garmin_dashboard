@@ -125,6 +125,14 @@ h3{font-size:.98rem;margin-bottom:12px}
 .legend .item{display:flex;align-items:center;gap:6px}
 .legend .trait{width:18px;height:0;border-top:2px solid}
 .legend .trait.pointille{border-top-style:dashed}
+details summary{cursor:pointer;color:var(--texte2)}
+.etapes{list-style:none;display:flex;flex-direction:column;gap:10px;margin:12px 0}
+.etapes li{display:flex;align-items:center;gap:10px;font-size:.9rem;flex-wrap:wrap}
+.etapes .num{display:inline-flex;align-items:center;justify-content:center;width:22px;height:22px;border-radius:50%;background:var(--primaire);color:#fff;font-size:.75rem;font-weight:700;flex:none}
+.etapes li.fait .num{background:var(--ok)}
+.etapes .etat{font-size:.8rem;color:var(--ok);font-weight:600}
+.btn-sm{padding:6px 12px;font-size:.8rem}
+#syncRapport{margin-top:10px;font-size:.85rem}
 </style>
 </head>
 <body>
@@ -141,15 +149,25 @@ h3{font-size:.98rem;margin-bottom:12px}
       <div class="boutons">
         <button class="btn" id="btnParcourir">Parcourir des fichiers .fit…</button>
         <button class="btn secondaire" id="btnDossier" title="Importer tous les .fit d'un dossier (récursif)">Sélectionner un dossier…</button>
-        <button class="btn secondaire" id="btnSync" title="Copier les nouveaux .fit de la montre vers un dossier du PC, puis les importer">Synchroniser depuis la montre…</button>
         <button class="btn secondaire" id="btnExport" title="Exporter le jeu de données agrégé en JSON">Exporter JSON</button>
         <button class="btn secondaire" id="btnImport" title="Recharger un export JSON précédent">Importer JSON…</button>
       </div>
       <input type="file" id="fileInput" accept=".fit" multiple hidden>
       <input type="file" id="dirInput" webkitdirectory hidden>
       <input type="file" id="jsonInput" accept=".json,application/json" hidden>
-      <div id="syncRapport" class="petit" style="margin-top:12px"></div>
     </div>
+  </div>
+
+  <div class="carte" id="carteSync">
+    <h3>Synchroniser depuis la montre</h3>
+    <p class="petit">Copie uniquement les <b>nouveaux</b> fichiers .fit de la montre vers un dossier de votre PC (l'arborescence est conservée), puis les importe ici. 100 % local ; nécessite Chrome ou Edge.</p>
+    <ol class="etapes">
+      <li id="etape1"><span class="num">1</span><span>Dossier de la montre (ex. volume <code>GARMIN</code>)</span><button class="btn secondaire btn-sm" id="btnSrcDir">Choisir…</button><span class="etat" id="etatSrc"></span></li>
+      <li id="etape2"><span class="num">2</span><span>Dossier de destination sur le PC</span><button class="btn secondaire btn-sm" id="btnDstDir">Choisir…</button><span class="etat" id="etatDst"></span></li>
+      <li id="etape3"><span class="num">3</span><span>Copier les nouveaux .fit et les importer</span><button class="btn btn-sm" id="btnLancerSync" disabled>Lancer la synchronisation</button></li>
+    </ol>
+    <div id="syncRapport" class="petit"></div>
+    <p class="petit">Alternative : « Sélectionner un dossier… » importe directement tous les .fit d'un dossier, sans copie. Les dossiers choisis à l'étape 1 et 2 sont mémorisés dans ce navigateur.</p>
   </div>
   <div id="statut"></div>
   <nav class="onglets" id="onglets">
@@ -364,11 +382,11 @@ class FitParser {
     if (hdrSize === 14) {
       const hdrCrcStored = dv.getUint16(12, true);
       const hdrCrcCalc = fitCrc16(bytes, 0, hdrSize - 2);
-      if (hdrCrcStored !== hdrCrcCalc) warnings.push('CRC de l\'en-tête invalide (attendu 0x' + hdrCrcStored.toString(16) + ', calculé 0x' + hdrCrcCalc.toString(16) + ') — décodage poursuivi.');
+      if (hdrCrcStored !== hdrCrcCalc) warnings.push('CRC de l\'en-tête invalide (fichier non conforme ou modifié) — décodage poursuivi.');
     }
     const fileCrcStored = dv.getUint16(14 + dataSize, true);
     const fileCrcCalc = fitCrc16(bytes, 0, 14 + dataSize);
-    if (fileCrcStored !== fileCrcCalc) warnings.push('CRC du fichier invalide (attendu 0x' + fileCrcStored.toString(16) + ', calculé 0x' + fileCrcCalc.toString(16) + ') — décodage poursuivi malgré tout.');
+    if (fileCrcStored !== fileCrcCalc) warnings.push('CRC du fichier invalide (fichier non conforme ou modifié) — décodage poursuivi malgré tout.');
 
     const header = { size: hdrSize, protocol, profile, dataSize, crcOk: fileCrcStored === fileCrcCalc };
     const messages = [];
@@ -651,6 +669,9 @@ const DEFAULT_THRESHOLDS = { heart_rate: { min: 50, max: 190 } };
 const PERIODES = { '1j': 1, '7j': 7, '30j': 30, '90j': 90, '365j': 365, 'tout': 0 };
 
 const SPORTS = { 0: 'Générique', 1: 'Course à pied', 2: 'Vélo', 3: 'Transition', 4: 'Fitness', 5: 'Natation', 6: 'Basketball', 7: 'Football', 8: 'Tennis', 9: 'Foot US', 10: 'Entraînement', 11: 'Marche', 12: 'Ski de fond', 17: 'Randonnée', 18: 'Vélo elliptique', 29: 'Yoga', 32: 'Pilates' };
+
+const FILE_TYPES = { 1: 'Capacités', 2: 'Réglages appareil', 3: 'Profil utilisateur', 4: 'Activité', 6: 'Appareil', 9: 'Entraînement', 10: 'Cours', 11: 'Objectif', 14: 'Niveau', 15: 'Profil sportif', 28: 'Monitoring', 32: 'Monitoring', 34: 'Résumé', 35: 'Résumé quotidien' };
+const MANUFACTURERS = { 1: 'Garmin', 255: 'Développement' };
 
 /* Sous-échantillonnage LTTB : garde `threshold` points représentatifs. */
 function lttb(points, threshold) {
@@ -983,17 +1004,47 @@ function initUI() {
     $('syncRapport').textContent = files.length + ' fichier(s) importé(s) depuis le dossier.';
   });
 
-  $('btnSync').addEventListener('click', async () => {
+  let srcDirHandle = null, dstDirHandle = null;
+
+  function updateSyncUI() {
+    $('etape1').classList.toggle('fait', !!srcDirHandle);
+    $('etape2').classList.toggle('fait', !!dstDirHandle);
+    $('etatSrc').textContent = srcDirHandle ? '\u2713 ' + srcDirHandle.name : '';
+    $('etatDst').textContent = dstDirHandle ? '\u2713 ' + dstDirHandle.name : '';
+    $('btnLancerSync').disabled = !(srcDirHandle && dstDirHandle);
+  }
+
+  /* Au chargement : réaffiche les dossiers déjà choisis (mémorisés) sans rien redemander. */
+  async function refreshEtatsSync() {
+    if (!window.showDirectoryPicker) {
+      $('syncRapport').textContent = 'La synchro de dossiers n\u00e9cessite Chrome ou Edge (File System Access API). Utilisez \u00ab S\u00e9lectionner un dossier\u2026 \u00bb ou le glisser-d\u00e9poser.';
+      return;
+    }
+    for (const [key, mode, set] of [['garmin-src', 'read', h => srcDirHandle = h], ['garmin-dst', 'readwrite', h => dstDirHandle = h]]) {
+      try {
+        const h = await loadHandle(key);
+        if (h && await h.queryPermission({ mode }) === 'granted') set(h);
+      } catch (e) { /* ignore */ }
+    }
+    updateSyncUI();
+  }
+
+  $('btnSrcDir').addEventListener('click', async () => {
+    try { srcDirHandle = await getDirHandle('garmin-src', 'read'); } catch (e) { return; }
+    updateSyncUI();
+  });
+  $('btnDstDir').addEventListener('click', async () => {
+    try { dstDirHandle = await getDirHandle('garmin-dst', 'readwrite'); } catch (e) { return; }
+    updateSyncUI();
+  });
+
+  $('btnLancerSync').addEventListener('click', async () => {
     const rapport = $('syncRapport');
     rapport.textContent = '';
-    if (!window.showDirectoryPicker) { rapport.innerHTML = '<span class="err">La synchro de dossiers nécessite un navigateur récent (File System Access API). Utilisez "Sélectionner un dossier…" ou le glisser-déposer.</span>'; return; }
-    let srcDir, dstDir;
-    try { srcDir = await getDirHandle('garmin-src', 'read'); } catch (e) { return; }
-    try { dstDir = await getDirHandle('garmin-dst', 'readwrite'); } catch (e) { return; }
-    if (!srcDir || !dstDir) return;
-    rapport.textContent = 'Lecture du dossier de la montre…';
+    if (!srcDirHandle || !dstDirHandle) return;
+    rapport.textContent = 'Lecture du dossier de la montre \u00ab ' + srcDirHandle.name + ' \u00bb\u2026';
     const entries = [];
-    await listFitFiles(srcDir, '', entries);
+    await listFitFiles(srcDirHandle, '', entries);
     let copies = 0, ignores = 0, erreurs = 0;
     for (const e of entries) {
       const base = e.rel.split('/').pop();
@@ -1001,13 +1052,13 @@ function initUI() {
         const srcFile = await e.handle.getFile();
         let ignore = false;
         try {
-          const dstH = await dstDir.getFileHandle(base);
+          const dstH = await dstDirHandle.getFileHandle(base);
           const dstFile = await dstH.getFile();
           if (dstFile.size === srcFile.size) ignore = true;
-        } catch (err) { /* n'existe pas encore */ }
+        } catch (err) { /* n'existe pas encore dans la destination */ }
         if (ignore) { ignores++; continue; }
         const parts = e.rel.split('/');
-        let dir = dstDir;
+        let dir = dstDirHandle;
         for (let i = 0; i < parts.length - 1; i++) dir = await dir.getDirectoryHandle(parts[i], { create: true });
         const dstH = await dir.getFileHandle(base, { create: true });
         const w = await dstH.createWritable();
@@ -1021,8 +1072,10 @@ function initUI() {
       }
     }
     apresImport();
-    rapport.innerHTML = 'Synchro terminée : <b>' + copies + '</b> nouveau(x) fichier(s) copié(s), ' + ignores + ' déjà présent(s), ' + erreurs + ' erreur(s) — ' + entries.length + ' .fit vus au total.';
+    rapport.innerHTML = 'Synchro termin\u00e9e : <b>' + copies + '</b> nouveau(x) fichier(s) copi\u00e9(s), ' + ignores + ' d\u00e9j\u00e0 pr\u00e9sent(s), ' + erreurs + ' erreur(s) \u2014 ' + entries.length + ' .fit vus au total.';
   });
+
+  refreshEtatsSync();
 
   async function importFiles(fileList) {
     const files = Array.from(fileList).filter(f => f.name.toLowerCase().endsWith('.fit'));
@@ -1108,11 +1161,17 @@ function initUI() {
     $('detailTitre').textContent = f.name;
     const fid = f.parsed.messages.find(m => m.name === 'file_id');
     const h = f.parsed.header;
-    $('detailMeta').innerHTML =
-      'Profil ' + h.profile + ' — protocole ' + h.protocol + ' — ' + f.parsed.messages.length + ' messages — CRC ' +
-      (h.crcOk ? '<span class="badge ok">valide</span>' : '<span class="badge warn">invalide</span>') +
-      (fid ? ' — ' + esc(JSON.stringify(fid.fields)) : '') +
-      (f.parsed.warnings.length ? '<br><span style="color:var(--warn)">' + f.parsed.warnings.map(esc).join('<br>') + '</span>' : '');
+    let meta = 'Profil ' + h.profile + ' — protocole ' + h.protocol + ' — ' + f.parsed.messages.length + ' messages — CRC ' +
+      (h.crcOk ? '<span class="badge ok">valide</span>' : '<span class="badge warn">invalide</span>');
+    if (fid) {
+      const ft = fid.fields.type, fm = fid.fields.manufacturer;
+      meta += ' — <b>' + esc(FILE_TYPES[ft] || ('type ' + ft)) + '</b>' +
+        (fm !== undefined && fm !== null ? ', fabricant ' + esc(MANUFACTURERS[fm] || fm) : '');
+      meta += ' <details class="petit"><summary>données brutes du file_id</summary><code style="word-break:break-all">' + esc(JSON.stringify(fid.raw)) + '</code></details>';
+    }
+    if (f.parsed.warnings.length)
+      meta += '<br>' + f.parsed.warnings.map(w => '<span class="badge warn">' + esc(w) + '</span>').join(' ');
+    $('detailMeta').innerHTML = meta;
     const sel = $('selMessage');
     const counts = {};
     f.parsed.messages.forEach(m => { counts[m.name] = (counts[m.name] || 0) + 1; });
