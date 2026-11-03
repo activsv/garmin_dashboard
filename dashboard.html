@@ -166,6 +166,7 @@ h3{font-size:.98rem;margin-bottom:12px}
       </div>
     </div>
     <div class="groupe"><label for="selMetrique">Métrique</label><select id="selMetrique"></select></div>
+    <div class="groupe"><label for="selSport">Sport</label><select id="selSport"></select></div>
     <div class="groupe"><label>Seuil min</label><input type="number" id="seuilMin" placeholder="—"></div>
     <div class="groupe"><label>Seuil max</label><input type="number" id="seuilMax" placeholder="—"></div>
     <div class="groupe"><label>&nbsp;</label><button class="btn secondaire" id="btnVueGlobale" style="display:none">← Vue globale</button></div>
@@ -717,12 +718,12 @@ function movingAverage(series, window) {
 
 /* Bornes de la période sélectionnée (ms). '1j' = aujourd'hui (minuit local),
    'Nj' = fenêtre glissante de N jours, 'tout' = étendue de toutes les données. */
-function periodBounds(periode, store) {
+function periodBounds(periode, store, recsOverride) {
   const now = Date.now();
   if (periode === 'tout' || !PERIODES[periode]) {
     let min = Infinity, max = -Infinity;
     const consider = t => { if (typeof t === 'number' && isFinite(t)) { if (t < min) min = t; if (t > max) max = t; } };
-    for (const r of store.recordsSorted()) consider(r.t);
+    for (const r of (recsOverride || store.recordsSorted())) consider(r.t);
     for (const p of store.monitoringSorted()) consider(p.t);
     for (const s of store.sessions) consider(s.startMs ?? s.t);
     for (const s of store.sleep) consider(s.t);
@@ -772,9 +773,17 @@ function dailyAgg(store) {
 /* KPIs sur la période : moyenne/min/max de la métrique (agrégats journaliers),
    tendance (7 derniers jours vs 7 précédents, sinon 2e moitié vs 1re moitié),
    nombre de séances. */
-function computeKPIs(store, metric, periode) {
+function computeKPIs(store, metric, periode, sport) {
   const m = METRICS[metric];
-  const { from, to } = periodBounds(periode, store);
+  sport = sport || 'tout';
+  const sess = sport === 'tout' ? store.sessions : store.sessions.filter(s => String(s.sport) === String(sport));
+  let recs = store.recordsSorted();
+  if (sport !== 'tout') {
+    const plages = sess.map(s => { const a = s.startMs ?? s.t; return [a, a + (s.total_elapsed_time || 0) * 1000]; })
+      .filter(p => typeof p[0] === 'number' && isFinite(p[0]));
+    recs = plages.length ? recs.filter(r => plages.some(([a, b]) => r.t >= a - 6e4 && r.t <= b + 6e4)) : [];
+  }
+  const { from, to } = periodBounds(periode, store, sport === 'tout' ? null : recs);
   let series;
   if (m.source === 'daily') {
     series = Array.from(dailyAgg(store).values())
@@ -783,7 +792,7 @@ function computeKPIs(store, metric, periode) {
       .filter(p => isFinite(p.y))
       .sort((a, b) => a.x - b.x);
   } else {
-    series = dailySeries(store.recordsSorted().filter(r => r.t >= from && r.t <= to), metric);
+    series = dailySeries(recs.filter(r => r.t >= from && r.t <= to), metric);
   }
   const vals = series.map(p => p.y);
   const moy = vals.length ? vals.reduce((a, b) => a + b, 0) / vals.length : null;
@@ -806,7 +815,7 @@ function computeKPIs(store, metric, periode) {
     const b = series.slice(0, half).reduce((x, p) => x + p.y, 0) / half;
     tendance = b ? (a - b) / Math.abs(b) * 100 : null;
   }
-  const seances = store.sessions.filter(s => { const t = s.startMs ?? s.t; return t >= from && t <= to; }).length;
+  const seances = sess.filter(s => { const t = s.startMs ?? s.t; return t >= from && t <= to; }).length;
   return { moy, min, max, tendance, seances, series, from, to };
 }
 
@@ -816,7 +825,7 @@ function computeKPIs(store, metric, periode) {
 function initUI() {
   let store = new DataStore();
   let fichierSel = null;
-  const state = { vue: 'fichiers', groupe: 'record', periode: '30j', metrique: 'heart_rate', seuilMin: null, seuilMax: null, zoomJour: null };
+  const state = { vue: 'fichiers', groupe: 'record', periode: '30j', metrique: 'heart_rate', sport: 'tout', seuilMin: null, seuilMax: null, zoomJour: null };
 
   const $ = id => document.getElementById(id);
   const dropZone = $('dropZone'), fileInput = $('fileInput'), jsonInput = $('jsonInput');
@@ -843,7 +852,7 @@ function initUI() {
     try {
       store = DataStore.fromJSON(await f.text());
       fichierSel = null;
-      render();
+      apresImport();
       $('statut').innerHTML = 'Jeu de données importé depuis <b>' + esc(f.name) + '</b> — ' + store.records.size + ' points, ' + store.sessions.length + ' séance(s).';
     } catch (err) {
       $('statut').innerHTML = '<span class="err">Import JSON impossible : ' + esc(err.message) + '</span>';
@@ -874,7 +883,20 @@ function initUI() {
     $('seuilMin').addEventListener('change', e => { state.seuilMin = e.target.value === '' ? null : Number(e.target.value); renderDashboard(); });
     $('seuilMax').addEventListener('change', e => { state.seuilMax = e.target.value === '' ? null : Number(e.target.value); renderDashboard(); });
     $('btnVueGlobale').addEventListener('click', () => { state.zoomJour = null; renderDashboard(); });
+    $('selSport').addEventListener('change', e => { state.sport = e.target.value; state.zoomJour = null; renderDashboard(); });
     window.addEventListener('resize', () => { if (state.vue === 'dashboard') renderDashboard(); else if (state.vue === 'sommeil') renderSommeil(); });
+  }
+
+  /* Remplit le sélecteur de sport avec les sports présents dans les séances. */
+  function fillSports() {
+    const sel = $('selSport');
+    const sports = new Set(store.sessions.map(s => s.sport).filter(s => s !== undefined && s !== null));
+    const opts = ['<option value="tout">Tous les sports</option>'];
+    for (const sp of Array.from(sports).sort((a, b) => a - b))
+      opts.push('<option value="' + sp + '">' + esc(SPORTS[sp] || ('Sport ' + sp)) + '</option>');
+    sel.innerHTML = opts.join('');
+    if (state.sport !== 'tout' && !sports.has(Number(state.sport)) && !sports.has(state.sport)) state.sport = 'tout';
+    sel.value = state.sport;
   }
 
   function fillMetriques() {
@@ -944,7 +966,7 @@ function initUI() {
       await listFitFiles(dir, '', entries);
       $('syncRapport').textContent = entries.length + ' fichier(s) .fit trouvés dans le dossier — import en cours…';
       for (const e of entries) await importFitEntry(e, e.rel);
-      render();
+      apresImport();
       $('syncRapport').textContent = entries.length + ' fichier(s) importé(s) depuis le dossier (' + store.okCount + ' décodés au total).';
     } else {
       $('dirInput').click();
@@ -957,7 +979,7 @@ function initUI() {
       try { store.addFile(f.webkitRelativePath || f.name, f.size, new FitParser().parse(await f.arrayBuffer()), null); }
       catch (err) { store.addFile(f.webkitRelativePath || f.name, f.size, null, err.message); }
     }
-    render();
+    apresImport();
     $('syncRapport').textContent = files.length + ' fichier(s) importé(s) depuis le dossier.';
   });
 
@@ -998,7 +1020,7 @@ function initUI() {
         store.addFile(e.rel, 0, null, err.message);
       }
     }
-    render();
+    apresImport();
     rapport.innerHTML = 'Synchro terminée : <b>' + copies + '</b> nouveau(x) fichier(s) copié(s), ' + ignores + ' déjà présent(s), ' + erreurs + ' erreur(s) — ' + entries.length + ' .fit vus au total.';
   });
 
@@ -1014,16 +1036,18 @@ function initUI() {
         store.addFile(f.name, f.size, null, err.message);
       }
     }
-    render();
+    apresImport();
   }
 
   function render() {
     const st = $('statut');
     const errs = store.files.filter(f => f.error);
     st.innerHTML = store.files.length
-      ? store.files.length + ' fichier(s) — <b>' + store.okCount + '</b> décodé(s), <span class="err">' + errs.length + ' en erreur</span>'
+      ? store.files.length + ' fichier(s) — <b>' + store.okCount + '</b> décodé(s), <span class="err">' + errs.length + ' en erreur</span>' +
+        ' — <b>' + store.records.size + '</b> points à la seconde, <b>' + store.sessions.length + '</b> séance(s), <b>' + store.monitoring.size + '</b> points monitoring, <b>' + store.daily.size + '</b> jour(s), <b>' + store.sleep.length + '</b> nuit(s)'
       : '';
     $('aucunFichier').style.display = store.files.length ? 'none' : 'block';
+    fillSports();
     const liste = $('listeFichiers');
     liste.innerHTML = '';
     store.files.forEach(f => {
@@ -1042,8 +1066,38 @@ function initUI() {
       liste.appendChild(div);
     });
     renderDetail();
-    if (state.vue === 'dashboard') renderDashboard();
-    else if (state.vue === 'sommeil') renderSommeil();
+    if (state.vue === 'dashboard') renderDashboardSafe();
+    else if (state.vue === 'sommeil') renderSommeilSafe();
+  }
+
+  /* Après un import : si des données existent et qu'on est sur l'onglet
+     "Fichiers & données", bascule automatiquement sur le dashboard. */
+  function apresImport() {
+    render();
+    if (state.vue === 'fichiers' && (store.records.size || store.monitoring.size || store.daily.size || store.sleep.length))
+      showVue('dashboard', state.groupe);
+  }
+
+  function showVue(vue, groupe) {
+    if (!vue) return;
+    state.vue = vue;
+    if (groupe) state.groupe = groupe;
+    fillMetriques();
+    document.querySelectorAll('#onglets .onglet').forEach(x => {
+      x.classList.toggle('actif', x.dataset.vue === vue && (!x.dataset.groupe || x.dataset.groupe === state.groupe));
+    });
+    document.querySelectorAll('section[id^="vue-"]').forEach(s => s.style.display = 'none');
+    $('vue-' + vue).style.display = 'block';
+    $('barreControles').style.display = vue === 'fichiers' ? 'none' : 'flex';
+    if (vue === 'dashboard') renderDashboardSafe();
+    else if (vue === 'sommeil') renderSommeilSafe();
+  }
+
+  function renderDashboardSafe() {
+    try { renderDashboard(); } catch (e) { $('statut').innerHTML = '<span class="err">Erreur d\'affichage : ' + esc(e.message) + '</span>'; console.error(e); }
+  }
+  function renderSommeilSafe() {
+    try { renderSommeil(); } catch (e) { $('statut').innerHTML = '<span class="err">Erreur d\'affichage : ' + esc(e.message) + '</span>'; console.error(e); }
   }
 
   function renderDetail() {
@@ -1093,15 +1147,7 @@ function initUI() {
 
   document.querySelectorAll('#onglets .onglet').forEach(b => b.addEventListener('click', () => {
     if (b.classList.contains('inactif')) return;
-    document.querySelectorAll('#onglets .onglet').forEach(x => x.classList.remove('actif'));
-    b.classList.add('actif');
-    state.vue = b.dataset.vue;
-    if (b.dataset.groupe) { state.groupe = b.dataset.groupe; fillMetriques(); }
-    document.querySelectorAll('section[id^="vue-"]').forEach(s => s.style.display = 'none');
-    $('vue-' + (state.vue === 'dashboard' ? 'dashboard' : state.vue)).style.display = 'block';
-    $('barreControles').style.display = state.vue === 'fichiers' ? 'none' : 'flex';
-    if (state.vue === 'dashboard') renderDashboard();
-    else if (state.vue === 'sommeil') renderSommeil();
+    showVue(b.dataset.vue, b.dataset.groupe);
   }));
 
   /* ---------- Onglet Activités : KPIs + graphiques + séances ---------- */
@@ -1109,7 +1155,7 @@ function initUI() {
   function renderDashboard() {
     const vide = !store.records.size && !store.monitoring.size && !store.daily.size && !store.sleep.length;
     $('bandeauVide').style.display = vide ? 'block' : 'none';
-    const k = computeKPIs(store, state.metrique, state.periode);
+    const k = computeKPIs(store, state.metrique, state.periode, state.sport);
     renderKPIs(k);
     const m = METRICS[state.metrique];
     $('titreGraphique').textContent = m.label + ' — par jour (' + periodeLabel(state.periode) + ')';
@@ -1318,9 +1364,10 @@ function initUI() {
   }
 
   function renderSeances(from, to) {
-    $('titreTable').textContent = 'Séances récentes';
+    $('titreTable').textContent = state.sport === 'tout' ? 'Séances récentes' : 'Séances récentes — ' + (SPORTS[state.sport] || ('Sport ' + state.sport));
     const tb = $('tableSeances');
     const rows = store.sessions
+      .filter(s => state.sport === 'tout' || String(s.sport) === String(state.sport))
       .filter(s => { const t = s.startMs ?? s.t; return t >= from - 1 && t <= to + 864e5; })
       .sort((a, b) => (b.startMs ?? b.t ?? 0) - (a.startMs ?? a.t ?? 0))
       .slice(0, 20);
