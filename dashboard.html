@@ -151,6 +151,20 @@ tbody tr:hover{background:#f8fafc}
 .etapes .etat{font-size:.8rem;color:var(--ok);font-weight:600}
 #syncRapport{margin-top:10px;font-size:.85rem}
 details summary{cursor:pointer;color:var(--texte2);font-size:.8rem}
+.kpi .spark{width:100%;height:34px;display:block;margin-top:8px}
+.cal-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px}
+.cal-head .titre{font-weight:700}
+.cal-head button{border:1px solid var(--bord);background:#fff;border-radius:6px;padding:4px 12px;cursor:pointer;font-size:.9rem}
+.cal-head button:hover{background:#eef6fb}
+.cal{display:grid;grid-template-columns:repeat(7,1fr);gap:5px}
+.cal .sem{font-size:.7rem;text-transform:uppercase;color:var(--texte2);text-align:center;padding:2px}
+.cal .case{border:1px solid var(--bord);border-radius:6px;padding:5px 4px;text-align:center;font-size:.75rem;min-height:54px;color:var(--texte2)}
+.cal .case .j{font-weight:700;color:var(--texte);font-size:.85rem}
+.cal .case.has{cursor:pointer;background:#eef6fb;border-color:var(--garmin);color:var(--texte)}
+.cal .case.has:hover{box-shadow:0 0 0 1px var(--garmin)}
+.cal .case.sel{background:#d3e9f7;border-color:var(--garmin);box-shadow:0 0 0 1px var(--garmin)}
+.cal .case .act{display:block;margin-top:3px;font-size:.68rem;color:var(--garmin);font-weight:600}
+.controles input[type=date]{padding:6px 8px;border:1px solid var(--bord);border-radius:8px;font-size:.82rem}
 </style>
 </head>
 <body>
@@ -178,6 +192,8 @@ details summary{cursor:pointer;color:var(--texte2);font-size:.8rem}
     <div class="groupe" id="groupeSport" style="display:none"><label for="selSport">Sport</label><select id="selSport"></select></div>
     <div class="groupe" id="groupeSeuilMin"><label>Seuil min</label><input type="number" id="seuilMin" placeholder="—"></div>
     <div class="groupe" id="groupeSeuilMax"><label>Seuil max</label><input type="number" id="seuilMax" placeholder="—"></div>
+    <div class="groupe"><label>Du</label><input type="date" id="dateDu"></div>
+    <div class="groupe"><label>Au</label><input type="date" id="dateAu"></div>
     <div class="groupe"><label>&nbsp;</label><button class="btn secondaire" id="btnVueGlobale" style="display:none">← Vue globale</button></div>
   </div>
 
@@ -185,6 +201,10 @@ details summary{cursor:pointer;color:var(--texte2);font-size:.8rem}
     <div class="carte vide" id="bandeauVide">Importez des fichiers .fit (onglet <b>Fichiers &amp; import</b> : glisser-déposer, bouton Parcourir, dossier ou synchro montre) pour voir vos statistiques ici.</div>
     <div id="contenuAccueil" style="display:none">
       <div class="kpi-grid" id="kpiAccueil"></div>
+      <div class="carte" id="carteDerniere" style="display:none">
+        <div class="cal-head"><span class="titre">Dernière activité</span><button class="btn secondaire btn-sm" id="btnVoirActivites">Voir dans Activités →</button></div>
+        <div id="derniereActivite"></div>
+      </div>
       <div class="carte">
         <h3 id="titreGraphAccueil">Graphique</h3>
         <div class="chart-wrap"><canvas id="chartAccueil"></canvas><div id="tooltip"></div></div>
@@ -205,6 +225,14 @@ details summary{cursor:pointer;color:var(--texte2);font-size:.8rem}
     <div class="carte vide" id="bandeauVideActivites">Aucune séance importée pour le moment.</div>
     <div id="contenuActivites" style="display:none">
       <div class="carte">
+        <div class="cal-head">
+          <span class="titre" id="calTitre">Calendrier</span>
+          <span><button id="calPrev" title="Mois précédent">‹</button> <button id="calNext" title="Mois suivant">›</button></span>
+        </div>
+        <div class="cal" id="calendrier"></div>
+        <p class="petit" id="calFiltre" style="margin-top:8px"></p>
+      </div>
+      <div class="carte">
         <h3>Séances <span class="petit" id="nbSeances"></span></h3>
         <div class="liste" id="listeSeances"></div>
       </div>
@@ -217,8 +245,12 @@ details summary{cursor:pointer;color:var(--texte2);font-size:.8rem}
         </div>
         <div class="chart-wrap"><canvas id="chartSeance"></canvas><div id="tooltip2"></div></div>
         <div class="legend" id="legendeSeance"></div>
+        <div id="carteLaps" style="display:none;margin-top:16px">
+          <h3>Tours (laps)</h3>
+          <div class="zone-scroll" style="max-height:240px"><table id="tableLaps"><thead></thead><tbody></tbody></table></div>
+        </div>
         <div id="carteCarteGps" style="display:none;margin-top:16px">
-          <h3>Tracé GPS</h3>
+          <h3>Tracé GPS <button class="btn secondaire btn-sm" id="btnExportGpx" style="margin-left:10px">Exporter GPX</button></h3>
           <div class="chart-wrap" style="height:300px"><canvas id="carteGps"></canvas></div>
         </div>
       </div>
@@ -652,6 +684,9 @@ class DataStore {
     this.hrPoints = [];         // {t, bpm} (hr 132 filtered_bpm)
     this.restingHr = [];        // {t, resting, current_day_resting} (monitoring_hr_data 211)
     this.gps = [];              // {t, lat, long, alt, speed} (record/gps_metadata positions)
+    this.hrZones = [];          // {index, high, name} depuis hr_zone (8)
+    this.userProfile = {};      // user_profile (3) : age, resting_heart_rate, default_max_heart_rate...
+    this.maxHr = null;          // zones_target (7) max_heart_rate
     this.other = {};            // autres messages par nom (debug)
     this._sessionKeys = new Set();
     this._fileKeys = new Set();
@@ -743,6 +778,15 @@ class DataStore {
             this.gps.push({ t, lat: m.fields.position_lat, long: m.fields.position_long, alt: m.fields.enhanced_altitude ?? null, speed: m.fields.enhanced_speed ?? null });
           break;
         }
+        case 'hr_zone':
+          this.hrZones.push({ index: m.fields.message_index ?? this.hrZones.length, high: m.fields.high_bpm ?? null, name: m.fields.name ?? null });
+          break;
+        case 'user_profile':
+          this.userProfile = Object.assign({}, m.fields);
+          break;
+        case 'zones_target':
+          if (typeof m.fields.max_heart_rate === 'number') this.maxHr = m.fields.max_heart_rate;
+          break;
         default:
           (this.other[m.name] = this.other[m.name] || []).push(m.fields);
       }
@@ -772,7 +816,8 @@ class DataStore {
       files: this.files.map(f => ({ name: f.name, size: f.size, error: f.error || null, doublon: !!f.doublon })),
       records: this.recordsSorted(), sessions: this.sessions, laps: this.laps,
       monitoring: this.monitoringSorted(), stress: this.stressSorted(), sleepLevels: this.sleepSorted(),
-      hrPoints: this.hrPoints, restingHr: this.restingHr, gps: this.gps, other: this.other,
+      hrPoints: this.hrPoints, restingHr: this.restingHr, gps: this.gps, hrZones: this.hrZones,
+      userProfile: this.userProfile, maxHr: this.maxHr, other: this.other,
     });
   }
 
@@ -792,6 +837,9 @@ class DataStore {
     st.hrPoints = data.hrPoints || [];
     st.restingHr = data.restingHr || [];
     st.gps = data.gps || [];
+    st.hrZones = data.hrZones || [];
+    st.userProfile = data.userProfile || {};
+    st.maxHr = data.maxHr ?? null;
     st.other = data.other || {};
     for (const f of st.files) if (!f.error && !f.doublon) st._fileKeys.add(f.name + '|' + f.size);
     return st;
@@ -829,7 +877,7 @@ const METRICS = {
   stress:     { label: 'Stress moyen', unit: '', color: '#8b5cf6', source: 'daily', field: 'stress_avg', decimals: 0, agg: 'avg' },
 };
 const DEFAULT_THRESHOLDS = { heart_rate: { min: 50, max: 190 } };
-const PERIODES = { '1j': 1, '7j': 7, '30j': 30, '90j': 90, '365j': 365, 'tout': 0 };
+const PERIODES = { '1j': 1, '7j': 7, '30j': 30, '90j': 90, '365j': 365, 'tout': 0, 'custom': -1 };
 
 /* Libellés FR des enums usuelles (complètent ENUMS du profil). */
 const SPORTS_FR = { 0:'Générique', 1:'Course à pied', 2:'Vélo', 3:'Transition', 4:'Fitness', 5:'Natation', 6:'Basketball', 7:'Football', 8:'Tennis', 9:'Foot US', 10:'Entraînement', 11:'Marche', 12:'Ski de fond', 13:'Ski alpin', 14:'Snowboard', 15:'Aviron', 16:'Alpinisme', 17:'Randonnée', 18:'Multisport', 21:'Vélo électrique', 25:'Golf', 29:'Pêche', 47:'Boxe', 53:'Plongée', 62:'HIIT', 67:'Méditation', 83:'Danse', 86:'Mobilité', 254:'Tous' };
@@ -920,10 +968,13 @@ function movingAverage(series, window) {
 }
 
 /* Bornes de la période sélectionnée (ms). '1j' = aujourd'hui (minuit local),
-   'Nj' = fenêtre glissante, 'tout' = étendue de toutes les données. */
-function periodBounds(periode, store) {
+   'Nj' = fenêtre glissante, 'tout' = étendue de toutes les données,
+   'custom' = [custom.from, custom.to] (dates choisies, inclusif). */
+function periodBounds(periode, store, custom) {
   const now = Date.now();
-  if (periode === 'tout' || !PERIODES[periode]) {
+  if (periode === 'custom' && custom && isFinite(custom.from) && isFinite(custom.to))
+    return { from: custom.from, to: custom.to + 864e5 - 1 };
+  if (periode === 'tout' || !PERIODES[periode] || PERIODES[periode] === 0 || PERIODES[periode] === -1) {
     let min = Infinity, max = -Infinity;
     const consider = t => { if (typeof t === 'number' && isFinite(t)) { if (t < min) min = t; if (t > max) max = t; } };
     for (const r of store.recordsSorted()) consider(r.t);
@@ -1031,7 +1082,7 @@ function dailyMetricSeries(store, metricKey, from, to) {
 
 /* Série journalière d'une métrique 'record' filtrée par sport (plages des
    séances) et par période. */
-function recordSeriesFor(store, metricKey, periode, sport) {
+function recordSeriesFor(store, metricKey, periode, sport, custom) {
   let recs = store.recordsSorted();
   if (sport && sport !== 'tout') {
     const sess = store.sessions.filter(s => String(s.sport) === String(sport));
@@ -1041,7 +1092,7 @@ function recordSeriesFor(store, metricKey, periode, sport) {
     }).filter(p => p && isFinite(p[0]));
     recs = plages.length ? recs.filter(r => plages.some(([a, b]) => r.t >= a - 6e4 && r.t <= b + 6e4)) : [];
   }
-  const { from, to } = periodBounds(periode, store);
+  const { from, to } = periodBounds(periode, store, custom);
   const m = METRICS[metricKey];
   const sub = recs.filter(r => r.t >= from && r.t <= to);
   if (m.source === 'record') return { series: dailySeries(sub, metricKey), from, to };
@@ -1070,9 +1121,9 @@ function recordSeriesFor(store, metricKey, periode, sport) {
 /* KPIs sur la période pour une métrique : moyenne/min/max de la série
    journalière, tendance (7 derniers jours vs 7 précédents, sinon 2e moitié
    vs 1re moitié), nombre de séances. */
-function computeKPIs(store, metricKey, periode, sport) {
+function computeKPIs(store, metricKey, periode, sport, custom) {
   const m = METRICS[metricKey];
-  const { series, from, to } = recordSeriesFor(store, metricKey, periode, sport);
+  const { series, from, to } = recordSeriesFor(store, metricKey, periode, sport, custom);
   const vals = series.map(p => p.y);
   const moy = vals.length ? vals.reduce((a, b) => a + b, 0) / vals.length : null;
   const min = vals.length ? Math.min(...vals) : null;
@@ -1098,31 +1149,69 @@ function computeKPIs(store, metricKey, periode, sport) {
   return { moy, min, max, tendance, seances, series, from, to };
 }
 
-/* Nuits de sommeil depuis sleep_level (275) : groupe par date locale,
-   durée = dernier - premier timestamp (+ delta moyen de la dernière tranche),
-   répartition par niveau. */
+/* Clé de "nuit" : une tranche avant midi (heure locale) appartient à la nuit
+   commencée la veille (comme Garmin Connect : la nuit du jour J couvre
+   le soir du J jusqu'au matin du J+1). */
+function sleepDayKey(t) {
+  const d = new Date(t);
+  if (d.getHours() < 12) return localDayKey(t - 864e5);
+  return localDayKey(t);
+}
+/* Zones de fréquence cardiaque pour le graphique d'une séance :
+   depuis les messages hr_zone (8) du fichier, sinon zones par défaut en %
+   de la FC max (zones_target / user_profile, ou 220 - âge, ou 190 bpm). */
+const HR_ZONE_COLORS = ['#90a4ae', '#42a5f5', '#66bb6a', '#ffa726', '#ef5350'];
+function getHrZones(store) {
+  if (store.hrZones.length) {
+    const sorted = store.hrZones.slice().sort((a, b) => (a.index ?? 0) - (b.index ?? 0));
+    const zones = [];
+    let lo = 0;
+    for (const z of sorted) {
+      if (typeof z.high !== 'number' || z.high <= lo) continue;
+      zones.push({ y0: lo + 1, y1: z.high, color: HR_ZONE_COLORS[(z.index ?? zones.length) % HR_ZONE_COLORS.length],
+        label: 'Z' + ((z.index ?? zones.length) + 1) + (z.name ? ' · ' + z.name : '') });
+      lo = z.high;
+    }
+    if (zones.length) return { zones, fcmax: lo };
+  }
+  const age = store.userProfile.age;
+  const fcmax = store.userProfile.default_max_heart_rate || store.maxHr ||
+    (typeof age === 'number' && age > 0 ? 220 - age : 190);
+  const zones = [];
+  const bounds = [0.6, 0.7, 0.8, 0.9, 1.0];
+  let lo = Math.round(fcmax * 0.5);
+  zones.push({ y0: 0, y1: lo, color: HR_ZONE_COLORS[0], label: 'Z1 (<60 %)' });
+  for (let i = 1; i < bounds.length; i++) {
+    const hi = Math.round(fcmax * bounds[i]);
+    zones.push({ y0: lo + 1, y1: hi, color: HR_ZONE_COLORS[i], label: 'Z' + (i + 1) + ' (' + Math.round(bounds[i - 1] * 100) + '–' + Math.round(bounds[i] * 100) + ' %)' });
+    lo = hi;
+  }
+  return { zones, fcmax };
+}
+
+/* Nuits de sommeil depuis sleep_level (275) : groupées par nuit (voir
+   sleepDayKey), durée = dernier - premier timestamp (+ delta moyen de la
+   dernière tranche), répartition par niveau. */
 function sleepNights(store) {
   const pts = store.sleepSorted();
   const byDay = new Map();
   for (const p of pts) {
-    const d = localDayKey(p.t);
+    const d = sleepDayKey(p.t);
     let e = byDay.get(d);
-    if (!e) { e = { date: d, t0: p.t, t1: p.t, levels: {} }; byDay.set(d, e); }
-    if (p.t < e.t0) e.t0 = p.t;
-    if (p.t > e.t1) e.t1 = p.t;
+    if (!e) { e = { date: d, levels: {} }; byDay.set(d, e); }
     e.levels[p.level] = (e.levels[p.level] || 0) + 1;
   }
   const out = [];
   for (const e of byDay.values()) {
-    // durée estimée : somme des deltas entre points consécutifs + dernier delta
+    const dayPts = pts.filter(p => sleepDayKey(p.t) === e.date).sort((a, b) => a.t - b.t);
     let duree = 0;
-    const dayPts = pts.filter(p => localDayKey(p.t) === e.date).sort((a, b) => a.t - b.t);
     if (dayPts.length >= 2) {
       let dsum = 0;
       for (let i = 1; i < dayPts.length; i++) dsum += dayPts[i].t - dayPts[i - 1].t;
-      duree = dsum + (dayPts.length > 1 ? dsum / (dayPts.length - 1) : 0);
-    } else if (dayPts.length === 1) duree = 0;
-    out.push({ date: e.date, x: dayStartMs(e.date), duree_s: duree / 1000, levels: e.levels, n: dayPts.length });
+      duree = dsum + dsum / (dayPts.length - 1); // + durée estimée de la dernière tranche
+    }
+    out.push({ date: e.date, x: dayStartMs(e.date), t0: dayPts[0].t, t1: dayPts[dayPts.length - 1].t,
+      duree_s: duree / 1000, levels: e.levels, n: dayPts.length });
   }
   out.sort((a, b) => a.x - b.x);
   return out;
@@ -1139,6 +1228,9 @@ function initUI() {
     vue: 'accueil', periode: '30j', metrique: 'steps', metriqueAccueil: 'steps',
     sport: 'tout', seuilMin: null, seuilMax: null,
     zoomAccueil: null, zoomSante: null, metriqueSeance: 'heart_rate',
+    custom: null,                 // {from, to} en ms pour la période libre
+    calAnnee: null, calMois: null, // mois affiché du calendrier (null = mois courant)
+    jourFiltre: null,              // 'YYYY-MM-DD' sélectionné dans le calendrier
   };
 
   const $ = id => document.getElementById(id);
@@ -1192,8 +1284,40 @@ function initUI() {
     $('btnVueGlobale').addEventListener('click', () => { state.zoomAccueil = null; state.zoomSante = null; renderVueCourante(); });
     $('selSport').addEventListener('change', e => { state.sport = e.target.value; renderVueCourante(); });
     $('btnFermerSeance').addEventListener('click', () => { seanceSel = null; renderActivites(); });
+    $('btnVoirActivites').addEventListener('click', () => { const s = derniereSeance(); if (s) { seanceSel = s; } showVue('activites'); });
+    $('btnExportGpx').addEventListener('click', () => exportGpxSeance());
+    // période libre (dates)
+    const majDates = () => {
+      const du = $('dateDu').value, au = $('dateAu').value;
+      if (du && au) {
+        state.custom = { from: new Date(du + 'T00:00:00').getTime(), to: new Date(au + 'T00:00:00').getTime() };
+        state.periode = 'custom';
+        document.querySelectorAll('#segPeriode button').forEach(x => x.classList.remove('actif'));
+      } else if (state.periode === 'custom') {
+        state.periode = '30j';
+        document.querySelector('#segPeriode button[data-p="30j"]').classList.add('actif');
+      }
+      state.zoomAccueil = null; state.zoomSante = null;
+      renderVueCourante();
+    };
+    $('dateDu').addEventListener('change', majDates);
+    $('dateAu').addEventListener('change', majDates);
+    // calendrier
+    $('calPrev').addEventListener('click', () => { decalMois(-1); });
+    $('calNext').addEventListener('click', () => { decalMois(1); });
     window.addEventListener('resize', () => renderVueCourante());
     document.querySelectorAll('#onglets .tab').forEach(b => b.addEventListener('click', () => showVue(b.dataset.vue)));
+  }
+  function decalMois(d) {
+    let [a, m] = [state.calAnnee ?? new Date().getFullYear(), state.calMois ?? new Date().getMonth()];
+    m += d;
+    if (m < 0) { m = 11; a--; } else if (m > 11) { m = 0; a++; }
+    state.calAnnee = a; state.calMois = m;
+    renderCalendrier();
+  }
+  function derniereSeance() {
+    if (!store.sessions.length) return null;
+    return store.sessions.slice().sort((a, b) => (b.startMs ?? b.t ?? 0) - (a.startMs ?? a.t ?? 0))[0];
   }
 
   /* ---------- import : fichiers, dossier, JSON ---------- */
@@ -1518,7 +1642,10 @@ function initUI() {
     return (h ? h + ' h ' + String(mi).padStart(2, '0') + ' min' : String(mi).padStart(2, '0') + ' min ' + String(se).padStart(2, '0') + ' s');
   }
   function periodeLabel(p) {
-    return { '1j': 'aujourd\'hui', '7j': '7 derniers jours', '30j': '30 derniers jours', '90j': '90 derniers jours', '365j': '1 an', 'tout': 'toutes les données' }[p] || p;
+    if (p === 'custom' && state.custom) {
+      return 'du ' + new Date(state.custom.from).toLocaleDateString('fr-FR') + ' au ' + new Date(state.custom.to).toLocaleDateString('fr-FR');
+    }
+    return { '1j': 'aujourd\'hui', '7j': '7 derniers jours', '30j': '30 derniers jours', '90j': '90 derniers jours', '365j': '1 an', 'tout': 'toutes les données', 'custom': 'période libre' }[p] || p;
   }
   function fmtMetrique(m, v) { return v === null || v === undefined || !isFinite(v) ? '—' : v.toFixed(m.decimals) + (m.unit ? ' ' + m.unit : ''); }
   function kpiCard(label, valueHtml, sous, sel) {
@@ -1561,6 +1688,16 @@ function initUI() {
     const pad = (yMax - yMin) * 0.08; yMin -= pad; if (!opts.barres) yMax += pad; else yMax += pad;
     const X = x => p.l + (x - xMin) / (xMax - xMin) * cw;
     const Y = y => p.t + ch - (y - yMin) / (yMax - yMin) * ch;
+    // bandes de zones (ex. zones de FC) en fond
+    if (opts.zones) {
+      for (const z of opts.zones) {
+        if (z.y1 <= yMin || z.y0 >= yMax) continue;
+        ctx.globalAlpha = 0.13;
+        ctx.fillStyle = z.color;
+        ctx.fillRect(p.l, Y(Math.min(z.y1, yMax)), cw, Y(Math.max(z.y0, yMin)) - Y(Math.min(z.y1, yMax)));
+        ctx.globalAlpha = 1;
+      }
+    }
     // grille + axe Y
     ctx.font = '11px sans-serif'; ctx.textAlign = 'right'; ctx.textBaseline = 'middle';
     for (let i = 0; i <= 4; i++) {
@@ -1663,8 +1800,27 @@ function initUI() {
     if (opts.seuilMin !== null && opts.seuilMin !== undefined) h += '<span class="item"><span class="trait pointille" style="border-color:#d97706"></span>Seuil min</span>';
     if (opts.seuilMax !== null && opts.seuilMax !== undefined) h += '<span class="item"><span class="trait pointille" style="border-color:#dc2626"></span>Seuil max</span>';
     if (opts.horsSeuil) h += '<span class="item"><span style="color:#dc2626">●</span>Hors seuil</span>';
+    if (opts.zones) for (const z of opts.zones) h += '<span class="item"><span style="display:inline-block;width:10px;height:10px;border-radius:2px;background:' + z.color + '"></span>' + esc(z.label) + '</span>';
     h += '<span class="item petit">clic sur un point = détail de la journée</span>';
     return h;
+  }
+  /* Mini-graphique (sparkline) pour les cartes KPI : courbe seule, sans axes. */
+  function drawSpark(cv, series, color) {
+    const { ctx, w, h } = prepCanvas(cv);
+    ctx.clearRect(0, 0, w, h);
+    const pts = series.filter(q => q.y !== null && isFinite(q.y));
+    if (!pts.length) return;
+    const ys = pts.map(q => q.y);
+    let yMin = Math.min(...ys), yMax = Math.max(...ys);
+    if (yMin === yMax) { yMin -= 1; yMax += 1; }
+    const X = i => (i / (pts.length - 1 || 1)) * (w - 4) + 2;
+    const Y = y => h - 3 - (y - yMin) / (yMax - yMin) * (h - 6);
+    ctx.strokeStyle = color; ctx.lineWidth = 1.6; ctx.beginPath();
+    pts.forEach((q, i) => { const x = X(i), y = Y(q.y); if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y); });
+    ctx.stroke();
+    ctx.lineTo(X(pts.length - 1), h); ctx.lineTo(2, h); ctx.closePath();
+    ctx.globalAlpha = 0.12; ctx.fillStyle = color; ctx.fill();
+    ctx.globalAlpha = 1;
   }
   /* Points d'une métrique pour le zoom jour (détail horaire/seconde). */
   function zoomPoints(metricKey, dayKey) {
@@ -1733,10 +1889,10 @@ function initUI() {
     if (!has) return;
     if (!METRICS[state.metriqueAccueil] || (METRICS[state.metriqueAccueil].source === 'record' && !store.records.size)) state.metriqueAccueil = store.monitoring.length || store.stress.length ? 'steps' : 'heart_rate';
     // cartes KPI cliquables (style Garmin Connect)
-    const { from, to } = periodBounds(state.periode, store);
+    const { from, to } = periodBounds(state.periode, store, state.custom);
     const agg = dailyAgg(store);
     const kpis = [];
-    const seances = computeKPIs(store, state.metriqueAccueil, state.periode, 'tout').seances;
+    const seances = computeKPIs(store, state.metriqueAccueil, state.periode, 'tout', state.custom).seances;
     kpis.push({ label: 'Séances', value: String(seances), sous: periodeLabel(state.periode), action: 'activites' });
     const sumField = (f, mul) => { let s = 0; for (const v of agg.values()) { const x = dayStartMs(v.date); if (x >= from - 864e5 && x <= to && typeof v[f] === 'number') s += v[f]; } return s * (mul || 1); };
     kpis.push({ label: 'Pas', value: Math.round(sumField('steps')).toLocaleString('fr-FR'), sous: periodeLabel(state.periode), met: 'steps' });
@@ -1754,8 +1910,16 @@ function initUI() {
     $('kpiAccueil').innerHTML = kpis.map(k => {
       const sel = k.met && k.met === state.metriqueAccueil ? ' sel' : '';
       const cible = k.action || '';
-      return '<div class="kpi' + sel + '" data-met="' + (k.met || '') + '" data-vue-cible="' + cible + '"><div class="label">' + esc(k.label) + '</div><div class="value">' + k.value + '</div><div class="sous">' + esc(k.sous) + '</div></div>';
+      const spark = k.met ? '<canvas class="spark" data-met="' + k.met + '"></canvas>' : '';
+      return '<div class="kpi' + sel + '" data-met="' + (k.met || '') + '" data-vue-cible="' + cible + '"><div class="label">' + esc(k.label) + '</div><div class="value">' + k.value + '</div>' + spark + '<div class="sous">' + esc(k.sous) + '</div></div>';
     }).join('');
+    // sparklines des cartes KPI (série journalière de chaque métrique)
+    document.querySelectorAll('#kpiAccueil .kpi .spark').forEach(cv => {
+      const mm = METRICS[cv.dataset.met];
+      if (!mm) return;
+      const { series } = recordSeriesFor(store, cv.dataset.met, state.periode, 'tout', state.custom);
+      drawSpark(cv, series, mm.color);
+    });
     document.querySelectorAll('#kpiAccueil .kpi').forEach(el => el.addEventListener('click', () => {
       if (el.dataset.met) {
         state.metriqueAccueil = el.dataset.met;
@@ -1766,13 +1930,44 @@ function initUI() {
         renderAccueil();
       } else if (el.dataset.vueCible) showVue(el.dataset.vueCible);
     }));
+    // carte « dernière activité » (style Garmin Connect)
+    renderDerniereActivite();
     // graphique principal (métrique sélectionnée)
     const m = METRICS[state.metriqueAccueil];
-    const { series } = recordSeriesFor(store, state.metriqueAccueil, state.periode, 'tout');
+    const { series } = recordSeriesFor(store, state.metriqueAccueil, state.periode, 'tout', state.custom);
     renderGraphiqueVue('Accueil', state.metriqueAccueil, series, state.zoomAccueil, d => { state.zoomAccueil = d; renderAccueil(); });
     // tableau : séances récentes (record) ou derniers jours (daily)
     if (m.source === 'record') renderTableSeances($('tableAccueil'), $('titreTableAccueil'), from, to, 'tout');
     else renderTableJours($('tableAccueil'), $('titreTableAccueil'), series);
+  }
+
+  /* Carte « Dernière activité » avec sparkline de FC de la séance. */
+  function renderDerniereActivite() {
+    const s = derniereSeance();
+    const carte = $('carteDerniere');
+    if (!s) { carte.style.display = 'none'; return; }
+    carte.style.display = 'block';
+    const t = s.startMs ?? s.t;
+    const plage = seancePlage(s);
+    const icon = SPORT_ICONS[s.sport] || '🏅';
+    $('derniereActivite').innerHTML =
+      '<div class="seance"><div class="icone">' + icon + '</div><div class="corps" style="flex:1">' +
+      '<div class="titre">' + esc(sportLabel(s.sport)) + (s.sub_sport ? ' · ' + subSportLabel(s.sub_sport) : '') + ' — ' + (t ? fmtDateHeure(t) : '—') + '</div>' +
+      '<div class="chiffres">' +
+      '<span>⏱ ' + (s.total_elapsed_time ? fmtDuree(s.total_elapsed_time) : '—') + '</span>' +
+      '<span>📏 ' + (typeof s.total_distance === 'number' ? (s.total_distance / 1000).toFixed(2) + ' km' : '—') + '</span>' +
+      '<span>🔥 ' + (s.total_calories ?? '—') + ' kcal</span>' +
+      '<span>❤️ ' + (s.avg_heart_rate ?? '—') + '/' + (s.max_heart_rate ?? '—') + ' bpm</span>' +
+      (typeof s.total_ascent === 'number' && s.total_ascent > 0 ? '<span>⛰ +' + Math.round(s.total_ascent) + ' m</span>' : '') +
+      '</div>' +
+      '<canvas id="sparkDerniere" style="width:100%;height:56px;display:block;margin-top:8px"></canvas>' +
+      '</div></div>';
+    if (plage) {
+      const pts = store.recordsSorted()
+        .filter(r => r.t >= plage[0] - 6e4 && r.t <= plage[1] + 6e4 && typeof r.heart_rate === 'number')
+        .map(r => ({ x: r.t, y: r.heart_rate }));
+      drawSpark($('sparkDerniere'), pts, '#e11d48');
+    }
   }
 
   /* ---------- ACTIVITÉS ---------- */
@@ -1782,7 +1977,7 @@ function initUI() {
     return [a, a + (s.total_elapsed_time || s.total_timer_time || 0) * 1000];
   }
   function renderActivites() {
-    const { from, to } = periodBounds(state.periode, store);
+    const { from, to } = periodBounds(state.periode, store, state.custom);
     let rows = store.sessions
       .filter(s => state.sport === 'tout' || String(s.sport) === String(state.sport))
       .filter(s => { const t = s.startMs ?? s.t; return t >= from - 1 && t <= to + 864e5; })
@@ -1791,7 +1986,9 @@ function initUI() {
     $('bandeauVideActivites').style.display = has ? 'none' : 'block';
     $('contenuActivites').style.display = has ? 'block' : 'none';
     if (!has) return;
-    $('nbSeances').textContent = '(' + rows.length + ' sur la période — ' + store.sessions.length + ' au total)';
+    renderCalendrier();
+    if (state.jourFiltre) rows = rows.filter(s => localDayKey(s.startMs ?? s.t ?? 0) === state.jourFiltre);
+    $('nbSeances').textContent = '(' + rows.length + ' affichée(s)' + (state.jourFiltre ? ' le ' + state.jourFiltre : '') + ' — ' + store.sessions.length + ' au total)';
     const liste = $('listeSeances');
     liste.innerHTML = '';
     rows.slice(0, 50).forEach(s => {
@@ -1814,6 +2011,51 @@ function initUI() {
       liste.appendChild(div);
     });
     renderDetailSeance();
+  }
+
+  /* Calendrier du mois affiché : chaque jour avec activité est cliquable
+     (filtre la liste des séances sur ce jour). */
+  function renderCalendrier() {
+    const cal = $('calendrier');
+    const now = new Date();
+    let a = state.calAnnee, mo = state.calMois;
+    if (a === null || mo === null) {
+      // par défaut : mois de la dernière séance, sinon mois courant
+      const s = derniereSeance();
+      if (s && (s.startMs ?? s.t)) { const d0 = new Date(s.startMs ?? s.t); a = d0.getFullYear(); mo = d0.getMonth(); }
+      else { a = now.getFullYear(); mo = now.getMonth(); }
+    }
+    state.calAnnee = a; state.calMois = mo;
+    $('calTitre').textContent = 'Calendrier — ' + new Date(a, mo, 1).toLocaleDateString('fr-FR', { month: 'long', year: 'numeric' });
+    const parJour = new Map();
+    for (const s of store.sessions) {
+      const t = s.startMs ?? s.t;
+      if (!t) continue;
+      const d = localDayKey(t);
+      let e = parJour.get(d);
+      if (!e) { e = { n: 0, duree: 0 }; parJour.set(d, e); }
+      e.n++; e.duree += s.total_elapsed_time || 0;
+    }
+    const startOffset = (new Date(a, mo, 1).getDay() + 6) % 7; // lundi = 0
+    const daysInMonth = new Date(a, mo + 1, 0).getDate();
+    let html = ['Lun', 'Mar', 'Mer', 'Jeu', 'Ven', 'Sam', 'Dim'].map(s => '<div class="sem">' + s + '</div>').join('');
+    for (let i = 0; i < startOffset; i++) html += '<div class="case"></div>';
+    for (let j = 1; j <= daysInMonth; j++) {
+      const key = a + '-' + String(mo + 1).padStart(2, '0') + '-' + String(j).padStart(2, '0');
+      const e = parJour.get(key);
+      const cls = 'case' + (e ? ' has' : '') + (state.jourFiltre === key ? ' sel' : '');
+      html += '<div class="' + cls + '" data-jour="' + key + '"><span class="j">' + j + '</span>' +
+        (e ? '<span class="act">' + e.n + ' act. · ' + (e.duree >= 3600 ? Math.round(e.duree / 3600) + ' h' : Math.round(e.duree / 60) + ' min') + '</span>' : '') +
+        '</div>';
+    }
+    cal.innerHTML = html;
+    cal.querySelectorAll('.case.has').forEach(c => c.addEventListener('click', () => {
+      state.jourFiltre = state.jourFiltre === c.dataset.jour ? null : c.dataset.jour;
+      renderActivites();
+    }));
+    $('calFiltre').textContent = state.jourFiltre
+      ? 'Filtré sur le ' + new Date(state.jourFiltre + 'T12:00:00').toLocaleDateString('fr-FR', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' }) + ' — recliquez sur le jour pour tout réafficher.'
+      : '';
   }
   function renderDetailSeance() {
     const carte = $('detailSeance');
@@ -1842,13 +2084,63 @@ function initUI() {
         });
     }
     const opts = { color: m.color, seuilMin: state.seuilMin, seuilMax: state.seuilMax, horsSeuil: true, fmtX: fmtHeure, fmtY: v => v.toFixed(m.decimals), msgVide: 'Aucun record sur cette séance' };
+    if (state.metriqueSeance === 'heart_rate') {
+      const hz = getHrZones(store);   // zones FC en fond (hr_zone du fichier ou % FCmax)
+      opts.zones = hz.zones;
+    }
     const map = drawLineChart($('chartSeance'), pts, opts);
-    $('legendeSeance').innerHTML = legendeHtml(m, { ...opts, ma: null }) ;
+    $('legendeSeance').innerHTML = legendeHtml(m, opts);
     bindChartInteractions($('chartSeance'), $('tooltip2'), map, pts, q => fmtHeure(q.x) + ' — ' + fmtMetrique(m, q.y), null);
+    // laps de la séance
+    const laps = plage ? store.laps
+      .filter(l => { const lt = l.t ?? (l.start_time ? Date.parse(l.start_time) : null); return lt !== null && lt >= plage[0] - 6e4 && lt <= plage[1] + 6e4; })
+      .sort((a, b) => (a.t ?? 0) - (b.t ?? 0)) : [];
+    if (laps.length) {
+      $('carteLaps').style.display = 'block';
+      let html = '<thead><tr><th>Début</th><th>Durée</th><th>Distance</th><th>FC moy</th><th>FC max</th><th>Allure moy</th></tr></thead><tbody>';
+      for (const l of laps) {
+        const lt = l.t ?? (l.start_time ? Date.parse(l.start_time) : null);
+        html += '<tr><td>' + (lt ? fmtHeure(lt) : '—') + '</td>' +
+          '<td>' + (l.total_elapsed_time ? fmtDuree(l.total_elapsed_time) : '—') + '</td>' +
+          '<td>' + (typeof l.total_distance === 'number' ? (l.total_distance / 1000).toFixed(2) + ' km' : '—') + '</td>' +
+          '<td>' + (l.avg_heart_rate ?? '—') + '</td><td>' + (l.max_heart_rate ?? '—') + '</td>' +
+          '<td>' + (typeof l.avg_speed === 'number' ? (l.avg_speed * 3.6).toFixed(1) + ' km/h' : '—') + '</td></tr>';
+      }
+      $('tableLaps').innerHTML = html + '</tbody>';
+    } else $('carteLaps').style.display = 'none';
     // carte GPS si positions disponibles sur la plage
     const gps = store.gps.filter(g => !plage || (g.t >= plage[0] - 6e4 && g.t <= plage[1] + 6e4));
     if (gps.length > 1) { $('carteCarteGps').style.display = 'block'; drawCarteGps(gps); }
     else $('carteCarteGps').style.display = 'none';
+  }
+  /* Export GPX de la séance sélectionnée (points GPS + FC/cadence), 100 % local. */
+  function exportGpxSeance() {
+    if (!seanceSel) return;
+    const plage = seancePlage(seanceSel);
+    const pts = store.gps.filter(g => !plage || (g.t >= plage[0] - 6e4 && g.t <= plage[1] + 6e4));
+    if (!pts.length) return;
+    const recByT = new Map();
+    for (const r of store.recordsSorted()) recByT.set(r.t, r);
+    let trkpts = '';
+    for (const g of pts) {
+      const rec = recByT.get(g.t) || {};
+      const hr = typeof rec.heart_rate === 'number' ? '<gpxtpx:hr>' + rec.heart_rate + '</gpxtpx:hr>' : '';
+      const cad = typeof rec.cadence === 'number' ? '<gpxtpx:cad>' + rec.cadence + '</gpxtpx:cad>' : '';
+      trkpts += '<trkpt lat="' + g.lat.toFixed(6) + '" lon="' + g.long.toFixed(6) + '">' +
+        (typeof g.alt === 'number' ? '<ele>' + g.alt.toFixed(1) + '</ele>' : '') +
+        '<time>' + new Date(g.t).toISOString() + '</time>' +
+        (hr || cad ? '<extensions><gpxtpx:TrackPointExtension>' + hr + cad + '</gpxtpx:TrackPointExtension></extensions>' : '') +
+        '</trkpt>';
+    }
+    const gpx = '<?xml version="1.0" encoding="UTF-8"?>\n' +
+      '<gpx version="1.1" creator="Garmin Connect local" xmlns="http://www.topografix.com/GPX/1/1" xmlns:gpxtpx="http://www.garmin.com/xmlschemas/TrackPointExtension/v1">' +
+      '<trk><name>' + esc(sportLabel(seanceSel.sport)) + ' ' + (plage ? new Date(plage[0]).toISOString().slice(0, 10) : '') + '</name><trkseg>' + trkpts + '</trkseg></trk></gpx>';
+    const blob = new Blob([gpx], { type: 'application/gpx+xml' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'activite-' + (plage ? new Date(plage[0]).toISOString().slice(0, 10) : 'export') + '.gpx';
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 5000);
   }
   /* Tracé GPS simple (projection équirectangulaire locale) sur canvas. */
   function drawCarteGps(gps) {
@@ -1912,7 +2204,7 @@ function initUI() {
       state.metrique = 'steps';
       $('selMetrique').value = 'steps';
     }
-    const k = computeKPIs(store, state.metrique, state.periode, 'tout');
+    const k = computeKPIs(store, state.metrique, state.periode, 'tout', state.custom);
     const m = METRICS[state.metrique];
     $('kpiSante').innerHTML =
       kpiCard('Moyenne ' + m.label.toLowerCase(), fmtMetrique(m, k.moy), periodeLabel(state.periode)) +
@@ -1977,7 +2269,7 @@ function initUI() {
 
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = { FitParser, DataStore, fitCrc16, applyCompressedOffset, GLOBAL_MESSAGES, FIELD_DEFS, ENUMS, FIT_EPOCH_MS, fitTimestampMs,
-    METRICS, PERIODES, lttb, dailySeries, movingAverage, periodBounds, dailyAgg, dailyMetricSeries, recordSeriesFor, computeKPIs, sleepNights, localDayKey, dayStartMs,
+    METRICS, PERIODES, lttb, dailySeries, movingAverage, periodBounds, dailyAgg, dailyMetricSeries, recordSeriesFor, computeKPIs, sleepNights, sleepDayKey, getHrZones, localDayKey, dayStartMs,
     sportLabel, fileTypeLabel };
 }
 if (typeof document !== 'undefined') {
