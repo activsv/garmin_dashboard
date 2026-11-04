@@ -1,0 +1,2442 @@
+<!DOCTYPE html>
+<!--
+================================================================================
+ GARMIN CONNECT (LOCAL) — Visualiseur de fichiers FIT 100 % local
+================================================================================
+ Une seule page HTML autonome : CSS + JS intégrés, aucune dépendance externe,
+ aucun serveur, aucune API distante, aucune donnée envoyée sur le réseau.
+ Ouvrir par simple double-clic, puis glisser-déposer des fichiers .fit
+ (ou sélectionner un dossier / synchroniser la montre).
+
+ ARCHITECTURE DU FICHIER (4 couches, vanilla JS, dans l'ordre) :
+   1. FIT_PROFILE + FitParser : tables du profil FIT officiel Garmin (générées
+      depuis le SDK) + décodeur binaire (header, CRC, messages de définition,
+      records, champs développeur, compressed timestamp headers).
+   2. DataStore  : agrège tous les fichiers importés en un jeu de données
+      chronologique unique (dédoublonnage : fichiers par nom+taille, records
+      par timestamp, monitoring par empreinte t+valeurs).
+   3. Calculs    : métriques, agrégats journaliers, KPIs, séries, LTTB.
+   4. UI         : onglets style Garmin Connect (Tableau de bord / Activités /
+      Santé / Sommeil / Fichiers), cartes KPI, graphiques Canvas dessinés à
+      la main (axes, courbe, moyenne glissante 7 j, seuils, hors-seuil, zoom
+      jour, tooltips), tableaux avec statut, import + synchro montre -> PC.
+
+--------------------------------------------------------------------------------
+ COMMENT AJOUTER UNE NOUVELLE MÉTRIQUE (ex. SpO2, température, puissance...)
+--------------------------------------------------------------------------------
+  1. Si la métrique vient d'un champ brut du .fit pas encore nommé : le profil
+     FIT_PROFILE.FIELD_DEFS (généré depuis le SDK Garmin) contient déjà la
+     plupart des champs ; si un champ manque, ajoutez-le à la main :
+        record: { 13: {name:'temperature', unit:'°C'} }   // n° de champ brut
+     avec scale/offset (ex. scale:5, offset:500 pour altitude) ou
+     convert:'semicircles' / convert:'timestamp'.
+  2. Dans METRICS (couche 3), ajoutez une entrée :
+        spo2: { label:'SpO2', unit:'%', color:'#8b5cf6', source:'record',
+                field:'spo2', agg:'avg', decimals:0 }
+     - source 'record' : série à la seconde (séances, zoom à la seconde)
+     - source 'mon'    : série monitoring (zoom par intervalle)
+     - source 'daily'  : valeur journalière (agrégée dans dailyAgg, champ
+                         'field' = clé produite par dailyAgg)
+     - agg : 'avg' (moyenne du jour) | 'max' | 'sum'
+     - mul : facteur affiché (ex. 3.6 pour m/s -> km/h)
+     - seuils : {min, max} optionnels (lignes pointillées + points hors seuil)
+  3. Si source 'daily', ajoutez le calcul du champ dans dailyAgg() (couche 3).
+  4. Rien d'autre : KPIs, sélecteur de métrique, graphiques, zoom et tableaux
+     utilisent automatiquement METRICS.
+================================================================================
+-->
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Garmin Connect local — Dashboard FIT</title>
+<style>
+:root{
+  --fond:#f4f5f7; --carte:#ffffff; --bord:#e3e6ea; --texte:#1a1a1a; --texte2:#6b7280;
+  --garmin:#007cc3; --garmin-f:#005f9e; --ok:#0e9f6e; --ok-fond:#d9f4e8;
+  --warn:#d97706; --warn-fond:#fdf0d5; --err:#dc2626; --err-fond:#fde2e2;
+  --ombre:0 1px 2px rgba(16,24,40,.06),0 1px 3px rgba(16,24,40,.08); --rayon:10px;
+}
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  background:var(--fond);color:var(--texte);line-height:1.5;min-height:100vh}
+.topbar{background:var(--carte);border-bottom:1px solid var(--bord);padding:0 24px;height:56px;
+  display:flex;align-items:center;justify-content:space-between;position:sticky;top:0;z-index:50;box-shadow:var(--ombre)}
+.brand{display:flex;align-items:baseline;gap:8px}
+.brand .logo{font-size:1.3rem;font-weight:800;letter-spacing:.14em;color:var(--garmin)}
+.brand .logo2{font-size:1.05rem;font-weight:600;color:var(--texte2)}
+.badge-local{font-size:.75rem;font-weight:600;color:var(--ok);background:var(--ok-fond);
+  padding:5px 12px;border-radius:999px;white-space:nowrap}
+.tabs{background:var(--carte);border-bottom:1px solid var(--bord);padding:0 24px;display:flex;gap:4px;
+  position:sticky;top:56px;z-index:49;flex-wrap:wrap}
+.tab{padding:12px 18px;border:none;background:none;font-size:.92rem;font-weight:600;color:var(--texte2);
+  cursor:pointer;border-bottom:3px solid transparent}
+.tab:hover{color:var(--texte);background:#f8fafc}
+.tab.actif{color:var(--garmin);border-bottom-color:var(--garmin)}
+.wrap{max-width:1280px;margin:0 auto;padding:20px 24px 60px}
+.carte{background:var(--carte);border:1px solid var(--bord);border-radius:var(--rayon);
+  box-shadow:var(--ombre);padding:20px;margin-bottom:20px}
+h3{font-size:1rem;margin-bottom:12px;font-weight:700}
+.petit{font-size:.78rem;color:var(--texte2)}
+#statut{font-size:.85rem;color:var(--texte2);margin-bottom:16px;min-height:1.2em}
+#statut .err{color:var(--err);font-weight:600}
+#dropZone{border:2px dashed var(--bord);border-radius:var(--rayon);padding:34px 20px;
+  text-align:center;cursor:pointer;transition:border-color .2s,background .2s;background:#f8fafc}
+#dropZone:hover,#dropZone.over{border-color:var(--garmin);background:#eef6fb}
+#dropZone .icone{font-size:2.2rem}
+#dropZone h2{font-size:1.05rem;margin:8px 0 4px}
+#dropZone p{font-size:.85rem;color:var(--texte2)}
+.boutons{display:flex;gap:10px;justify-content:center;margin-top:14px;flex-wrap:wrap}
+.btn{padding:9px 18px;border:none;border-radius:8px;font-size:.9rem;font-weight:600;cursor:pointer;
+  background:var(--garmin);color:#fff;transition:background .15s}
+.btn:hover{background:var(--garmin-f)}
+.btn.secondaire{background:#e9edf1;color:var(--texte)}
+.btn.secondaire:hover{background:#d8dee5}
+.btn:disabled{opacity:.5;cursor:not-allowed}
+.btn-sm{padding:6px 12px;font-size:.8rem}
+.controles{display:flex;flex-wrap:wrap;gap:18px;align-items:flex-end;margin-bottom:20px}
+.controles .groupe{display:flex;flex-direction:column;gap:5px}
+.controles label{font-size:.72rem;font-weight:700;text-transform:uppercase;letter-spacing:.05em;color:var(--texte2)}
+.seg{display:flex;background:#e9edf1;border-radius:8px;padding:2px;gap:2px}
+.seg button{padding:6px 12px;border:none;background:transparent;font-size:.82rem;cursor:pointer;color:var(--texte2);border-radius:6px}
+.seg button.actif{background:#fff;color:var(--garmin);font-weight:700;box-shadow:var(--ombre)}
+select{padding:7px 10px;border:1px solid var(--bord);border-radius:8px;font-size:.85rem;background:#fff;color:var(--texte)}
+.controles input[type=number]{width:90px;padding:7px 10px;border:1px solid var(--bord);border-radius:8px;font-size:.85rem}
+.kpi-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:14px;margin-bottom:20px}
+.kpi{background:var(--carte);border:1px solid var(--bord);border-radius:var(--rayon);box-shadow:var(--ombre);
+  padding:14px 16px;cursor:pointer;transition:box-shadow .15s,border-color .15s}
+.kpi:hover{border-color:var(--garmin)}
+.kpi.sel{border-color:var(--garmin);box-shadow:0 0 0 1px var(--garmin)}
+.kpi .label{font-size:.72rem;text-transform:uppercase;letter-spacing:.05em;color:var(--texte2);margin-bottom:5px}
+.kpi .value{font-size:1.5rem;font-weight:800;line-height:1.15}
+.kpi .sous{font-size:.76rem;color:var(--texte2);margin-top:4px}
+.kpi .tendance{font-weight:700}
+.kpi .tendance.haut{color:var(--ok)} .kpi .tendance.bas{color:var(--err)} .kpi .tendance.neutre{color:var(--texte2)}
+.chart-wrap{position:relative;height:340px}
+.chart-wrap canvas{width:100%;height:100%;display:block;cursor:crosshair}
+#tooltip,#tooltip2,#tooltip3{position:absolute;pointer-events:none;background:rgba(17,24,39,.94);color:#fff;
+  font-size:.78rem;padding:6px 10px;border-radius:6px;display:none;white-space:nowrap;z-index:10;transform:translate(-50%,-120%)}
+.legend{display:flex;gap:16px;flex-wrap:wrap;font-size:.78rem;color:var(--texte2);margin-top:8px}
+.legend .item{display:flex;align-items:center;gap:6px}
+.legend .trait{width:18px;height:0;border-top:2px solid}
+.legend .trait.pointille{border-top-style:dashed}
+table{border-collapse:collapse;width:100%;font-size:.85rem}
+th,td{padding:8px 10px;text-align:left;border-bottom:1px solid var(--bord);white-space:nowrap}
+th{font-size:.72rem;text-transform:uppercase;letter-spacing:.04em;color:var(--texte2);background:#f8fafc}
+tbody tr:hover{background:#f8fafc}
+.zone-scroll{max-height:380px;overflow:auto;border:1px solid var(--bord);border-radius:8px}
+.badge{display:inline-block;padding:3px 10px;border-radius:999px;font-size:.74rem;font-weight:700}
+.badge.ok{background:var(--ok-fond);color:var(--ok)}
+.badge.alert{background:var(--err-fond);color:var(--err)}
+.badge.warn{background:var(--warn-fond);color:var(--warn)}
+.badge.info{background:#e0f2fe;color:#0369a1}
+.liste{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:12px}
+.item{border:1px solid var(--bord);border-radius:8px;padding:12px 14px;cursor:pointer;background:#fff;transition:border-color .15s}
+.item:hover{border-color:var(--garmin)}
+.item.sel{border-color:var(--garmin);box-shadow:0 0 0 1px var(--garmin)}
+.item .nom{font-weight:700;font-size:.9rem;word-break:break-all}
+.item .meta{font-size:.78rem;color:var(--texte2);margin-top:4px}
+.item .meta .err{color:var(--err);font-weight:600}
+.seance{display:flex;gap:14px;align-items:flex-start}
+.seance .icone{font-size:1.7rem;line-height:1.2}
+.seance .corps{flex:1}
+.seance .titre{font-weight:700;font-size:.92rem}
+.seance .chiffres{font-size:.8rem;color:var(--texte2);margin-top:3px;display:flex;flex-wrap:wrap;gap:4px 14px}
+.vide{text-align:center;color:var(--texte2);padding:36px 20px;font-size:.9rem}
+.etapes{list-style:none;display:flex;flex-direction:column;gap:10px;margin:12px 0}
+.etapes li{display:flex;align-items:center;gap:10px;font-size:.9rem;flex-wrap:wrap}
+.etapes .num{display:inline-flex;align-items:center;justify-content:center;width:22px;height:22px;border-radius:50%;
+  background:var(--garmin);color:#fff;font-size:.75rem;font-weight:700;flex:none}
+.etapes li.fait .num{background:var(--ok)}
+.etapes .etat{font-size:.8rem;color:var(--ok);font-weight:600}
+#syncRapport{margin-top:10px;font-size:.85rem}
+details summary{cursor:pointer;color:var(--texte2);font-size:.8rem}
+.kpi .spark{width:100%;height:34px;display:block;margin-top:8px}
+.cal-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px}
+.cal-head .titre{font-weight:700}
+.cal-head button{border:1px solid var(--bord);background:#fff;border-radius:6px;padding:4px 12px;cursor:pointer;font-size:.9rem}
+.cal-head button:hover{background:#eef6fb}
+.cal{display:grid;grid-template-columns:repeat(7,1fr);gap:5px}
+.cal .sem{font-size:.7rem;text-transform:uppercase;color:var(--texte2);text-align:center;padding:2px}
+.cal .case{border:1px solid var(--bord);border-radius:6px;padding:5px 4px;text-align:center;font-size:.75rem;min-height:54px;color:var(--texte2)}
+.cal .case .j{font-weight:700;color:var(--texte);font-size:.85rem}
+.cal .case.has{cursor:pointer;background:#eef6fb;border-color:var(--garmin);color:var(--texte)}
+.cal .case.has:hover{box-shadow:0 0 0 1px var(--garmin)}
+.cal .case.sel{background:#d3e9f7;border-color:var(--garmin);box-shadow:0 0 0 1px var(--garmin)}
+.cal .case .act{display:block;margin-top:3px;font-size:.68rem;color:var(--garmin);font-weight:600}
+.controles input[type=date]{padding:6px 8px;border:1px solid var(--bord);border-radius:8px;font-size:.82rem}
+</style>
+</head>
+<body>
+<header class="topbar">
+  <div class="brand"><span class="logo">GARMIN</span><span class="logo2">connect · local</span></div>
+  <div class="badge-local">🔒 100 % local — aucune donnée envoyée sur le réseau</div>
+</header>
+<nav class="tabs" id="onglets">
+  <button class="tab actif" data-vue="accueil">Tableau de bord</button>
+  <button class="tab" data-vue="activites">Activités</button>
+  <button class="tab" data-vue="sante">Santé</button>
+  <button class="tab" data-vue="sommeil">Sommeil</button>
+  <button class="tab" data-vue="fichiers">Fichiers &amp; import</button>
+</nav>
+<div class="wrap">
+  <div id="statut"></div>
+
+  <div class="carte controles" id="barreControles" style="display:none">
+    <div class="groupe"><label>Période</label>
+      <div class="seg" id="segPeriode">
+        <button data-p="1j">1 j</button><button data-p="7j">7 j</button><button data-p="30j" class="actif">30 j</button><button data-p="90j">90 j</button><button data-p="365j">1 an</button><button data-p="tout">Tout</button>
+      </div>
+    </div>
+    <div class="groupe" id="groupeMetrique"><label for="selMetrique">Métrique</label><select id="selMetrique"></select></div>
+    <div class="groupe" id="groupeSport" style="display:none"><label for="selSport">Sport</label><select id="selSport"></select></div>
+    <div class="groupe" id="groupeSeuilMin"><label>Seuil min</label><input type="number" id="seuilMin" placeholder="—"></div>
+    <div class="groupe" id="groupeSeuilMax"><label>Seuil max</label><input type="number" id="seuilMax" placeholder="—"></div>
+    <div class="groupe"><label>Du</label><input type="date" id="dateDu"></div>
+    <div class="groupe"><label>Au</label><input type="date" id="dateAu"></div>
+    <div class="groupe"><label>&nbsp;</label><button class="btn secondaire" id="btnVueGlobale" style="display:none">← Vue globale</button></div>
+  </div>
+
+  <section id="vue-accueil">
+    <div class="carte vide" id="bandeauVide">Importez des fichiers .fit (onglet <b>Fichiers &amp; import</b> : glisser-déposer, bouton Parcourir, dossier ou synchro montre) pour voir vos statistiques ici.</div>
+    <div id="contenuAccueil" style="display:none">
+      <div class="kpi-grid" id="kpiAccueil"></div>
+      <div class="carte" id="carteDerniere" style="display:none">
+        <div class="cal-head"><span class="titre">Dernière activité</span><button class="btn secondaire btn-sm" id="btnVoirActivites">Voir dans Activités →</button></div>
+        <div id="derniereActivite"></div>
+      </div>
+      <div class="carte">
+        <h3 id="titreGraphAccueil">Graphique</h3>
+        <div class="chart-wrap"><canvas id="chartAccueil"></canvas><div id="tooltip"></div></div>
+        <div class="legend" id="legendeAccueil"></div>
+      </div>
+      <div class="carte" id="zoomCarteAccueil" style="display:none">
+        <h3 id="titreZoomAccueil">Détail de la journée</h3>
+        <div class="chart-wrap"><canvas id="zoomAccueil"></canvas></div>
+      </div>
+      <div class="carte">
+        <h3 id="titreTableAccueil">Dernières entrées</h3>
+        <div class="zone-scroll" style="max-height:320px"><table id="tableAccueil"><thead></thead><tbody></tbody></table></div>
+      </div>
+    </div>
+  </section>
+
+  <section id="vue-activites" style="display:none">
+    <div class="carte vide" id="bandeauVideActivites">Aucune séance importée pour le moment.</div>
+    <div id="contenuActivites" style="display:none">
+      <div class="carte">
+        <div class="cal-head">
+          <span class="titre" id="calTitre">Calendrier</span>
+          <span><button id="calPrev" title="Mois précédent">‹</button> <button id="calNext" title="Mois suivant">›</button></span>
+        </div>
+        <div class="cal" id="calendrier"></div>
+        <p class="petit" id="calFiltre" style="margin-top:8px"></p>
+      </div>
+      <div class="carte">
+        <h3>Séances <span class="petit" id="nbSeances"></span></h3>
+        <div class="liste" id="listeSeances"></div>
+      </div>
+      <div class="carte" id="detailSeance" style="display:none">
+        <h3 id="titreSeance">Détail de la séance</h3>
+        <div class="kpi-grid" id="kpiSeance"></div>
+        <div class="controles">
+          <div class="groupe"><label for="selMetriqueSeance">Métrique</label><select id="selMetriqueSeance"></select></div>
+          <div class="groupe"><label>&nbsp;</label><button class="btn secondaire btn-sm" id="btnFermerSeance">Fermer le détail</button></div>
+        </div>
+        <div class="chart-wrap"><canvas id="chartSeance"></canvas><div id="tooltip2"></div></div>
+        <div class="legend" id="legendeSeance"></div>
+        <div id="carteLaps" style="display:none;margin-top:16px">
+          <h3>Tours (laps)</h3>
+          <div class="zone-scroll" style="max-height:240px"><table id="tableLaps"><thead></thead><tbody></tbody></table></div>
+        </div>
+        <div id="carteCarteGps" style="display:none;margin-top:16px">
+          <h3>Tracé GPS <button class="btn secondaire btn-sm" id="btnExportGpx" style="margin-left:10px">Exporter GPX</button></h3>
+          <div class="chart-wrap" style="height:300px"><canvas id="carteGps"></canvas></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section id="vue-sante" style="display:none">
+    <div class="carte vide" id="bandeauVideSante">Aucune donnée de santé (monitoring) importée pour le moment.</div>
+    <div id="contenuSante" style="display:none">
+      <div class="kpi-grid" id="kpiSante"></div>
+      <div class="carte">
+        <h3 id="titreGraphSante">Graphique</h3>
+        <div class="chart-wrap"><canvas id="chartSante"></canvas><div id="tooltip3"></div></div>
+        <div class="legend" id="legendeSante"></div>
+      </div>
+      <div class="carte" id="zoomCarteSante" style="display:none">
+        <h3 id="titreZoomSante">Détail de la journée</h3>
+        <div class="chart-wrap"><canvas id="zoomSante"></canvas></div>
+      </div>
+      <div class="carte">
+        <h3>Derniers jours <button class="btn secondaire btn-sm" id="btnExportCsv" style="margin-left:10px">Exporter CSV</button></h3>
+        <div class="zone-scroll" style="max-height:320px"><table id="tableSante"><thead></thead><tbody></tbody></table></div>
+      </div>
+      <div class="carte" id="carteZones" style="display:none">
+        <h3>Temps dans les zones de fréquence cardiaque (séances)</h3>
+        <div class="chart-wrap" style="height:280px"><canvas id="chartZones"></canvas></div>
+        <div class="legend" id="legendeZones"></div>
+      </div>
+    </div>
+  </section>
+
+  <section id="vue-sommeil" style="display:none">
+    <div class="carte vide" id="bandeauVideSommeil">Aucune donnée de sommeil importée pour le moment.</div>
+    <div id="contenuSommeil" style="display:none">
+      <div class="kpi-grid" id="kpiSommeil"></div>
+      <div class="carte">
+        <h3>Durée de sommeil par nuit</h3>
+        <div class="chart-wrap"><canvas id="chartSommeil"></canvas></div>
+        <div class="legend" id="legendeSommeil"></div>
+      </div>
+      <div class="carte">
+        <h3>Nuits récentes (niveaux de sommeil)</h3>
+        <div class="zone-scroll" style="max-height:320px"><table id="tableSommeil"><thead></thead><tbody></tbody></table></div>
+      </div>
+    </div>
+  </section>
+
+  <section id="vue-fichiers" style="display:none">
+    <div class="carte">
+      <div id="dropZone">
+        <div class="icone">⌚</div>
+        <h2>Glissez-déposez vos fichiers .fit ici</h2>
+        <p>Plusieurs fichiers acceptés (activités, monitoring, sommeil…). Les fichiers corrompus sont signalés, les autres continuent d'être traités.</p>
+        <div class="boutons">
+          <button class="btn" id="btnParcourir">Parcourir des fichiers .fit…</button>
+          <button class="btn secondaire" id="btnDossier" title="Importer tous les .fit d'un dossier (récursif)">Sélectionner un dossier…</button>
+          <button class="btn secondaire" id="btnExport" title="Exporter le jeu de données agrégé en JSON">Exporter JSON</button>
+          <button class="btn secondaire" id="btnImport" title="Recharger un export JSON précédent">Importer JSON…</button>
+        </div>
+        <input type="file" id="fileInput" accept=".fit,.FIT" multiple hidden>
+        <input type="file" id="dirInput" webkitdirectory hidden>
+        <input type="file" id="jsonInput" accept=".json,application/json" hidden>
+      </div>
+    </div>
+
+    <div class="carte">
+      <h3>Synchroniser depuis la montre</h3>
+      <p class="petit">Copie uniquement les <b>nouveaux</b> fichiers .fit de la montre vers un dossier de votre PC (arborescence conservée), puis les importe ici. 100 % local ; nécessite Chrome ou Edge.</p>
+      <ol class="etapes">
+        <li id="etape1"><span class="num">1</span><span>Dossier de la montre (ex. volume <code>GARMIN</code>)</span><button class="btn secondaire btn-sm" id="btnSrcDir">Choisir…</button><span class="etat" id="etatSrc"></span></li>
+        <li id="etape2"><span class="num">2</span><span>Dossier de destination sur le PC</span><button class="btn secondaire btn-sm" id="btnDstDir">Choisir…</button><span class="etat" id="etatDst"></span></li>
+        <li id="etape3"><span class="num">3</span><span>Copier les nouveaux .fit et les importer</span><button class="btn btn-sm" id="btnLancerSync" disabled>Lancer la synchronisation</button></li>
+      </ol>
+      <div id="syncRapport" class="petit"></div>
+      <p class="petit">Alternative : « Sélectionner un dossier… » importe directement tous les .fit d'un dossier, sans copie. Les dossiers choisis (étapes 1 et 2) sont mémorisés dans ce navigateur.</p>
+    </div>
+
+    <div class="carte" id="carteAppareil" style="display:none">
+      <h3>Appareil &amp; profil</h3>
+      <div id="infosAppareil" class="petit" style="line-height:1.9"></div>
+    </div>
+    <div class="carte">
+      <h3>Fichiers importés</h3>
+      <div class="liste" id="listeFichiers"></div>
+      <div class="vide" id="aucunFichier">Aucun fichier importé pour le moment.</div>
+    </div>
+    <div class="carte" id="detailFichier" style="display:none">
+      <h3 id="detailTitre">Détail du fichier</h3>
+      <div id="detailMeta" class="petit" style="margin-bottom:12px"></div>
+      <div style="margin-bottom:10px">
+        <label class="petit" for="selMessage">Type de message :</label>
+        <select id="selMessage"></select>
+      </div>
+      <div class="zone-scroll"><table id="tableMessages"><thead></thead><tbody></tbody></table></div>
+    </div>
+  </section>
+</div>
+
+<script>
+'use strict';
+const FIT_PROFILE = {"GLOBAL_MESSAGES":{"0":"file_id","49":"file_creator","162":"timestamp_correlation","35":"software","106":"slave_device","1":"capabilities","37":"file_capabilities","38":"mesg_capabilities","39":"field_capabilities","2":"device_settings","3":"user_profile","4":"hrm_profile","5":"sdm_profile","6":"bike_profile","127":"connectivity","159":"watchface_settings","188":"ohr_settings","216":"time_in_zone","7":"zones_target","12":"sport","8":"hr_zone","53":"speed_zone","131":"cadence_zone","9":"power_zone","10":"met_zone","13":"training_settings","258":"dive_settings","262":"dive_alarm","393":"dive_apnea_alarm","259":"dive_gas","15":"goal","34":"activity","18":"session","19":"lap","101":"length","20":"record","21":"event","23":"device_info","375":"device_aux_battery_info","72":"training_file","104":"battery","128":"weather_conditions","129":"weather_alert","160":"gps_metadata","161":"camera_event","164":"gyroscope_data","165":"accelerometer_data","208":"magnetometer_data","209":"barometer_data","167":"three_d_sensor_calibration","210":"one_d_sensor_calibration","169":"video_frame","174":"obdii_data","177":"nmea_sentence","178":"aviation_attitude","184":"video","185":"video_title","186":"video_description","187":"video_clip","225":"set","285":"jump","312":"split","313":"split_summary","317":"climb_pro","206":"field_description","207":"developer_data_id","31":"course","32":"course_point","148":"segment_id","149":"segment_leaderboard_entry","150":"segment_point","142":"segment_lap","151":"segment_file","26":"workout","158":"workout_session","27":"workout_step","264":"exercise_title","28":"schedule","33":"totals","30":"weight_scale","51":"blood_pressure","103":"monitoring_info","55":"monitoring","211":"monitoring_hr_data","269":"spo2_data","132":"hr","227":"stress_level","229":"max_met_data","314":"hsa_body_battery_data","315":"hsa_event","302":"hsa_accelerometer_data","376":"hsa_gyroscope_data","304":"hsa_step_data","305":"hsa_spo2_data","306":"hsa_stress_data","307":"hsa_respiration_data","308":"hsa_heart_rate_data","389":"hsa_configuration_data","409":"hsa_wrist_temperature_data","145":"memo_glob","275":"sleep_level","82":"ant_channel_id","80":"ant_rx","81":"ant_tx","200":"exd_screen_configuration","201":"exd_data_field_configuration","202":"exd_data_concept_configuration","268":"dive_summary","289":"aad_accel_features","78":"hrv","290":"beat_intervals","370":"hrv_status_summary","371":"hrv_value","372":"raw_bbi","297":"respiration_rate","387":"chrono_shot_session","388":"chrono_shot_data","319":"tank_update","323":"tank_summary","346":"sleep_assessment","470":"sleep_disruption_severity_period","471":"sleep_disruption_overnight_severity","412":"nap_event","398":"skin_temp_overnight","105":"pad"},"FIELD_DEFS":{"file_id":{"0":{"name":"type"},"1":{"name":"manufacturer","base":"uint16","bsize":2},"2":{"name":"product","base":"uint16","bsize":2},"3":{"name":"serial_number","base":"uint32z","bsize":4},"4":{"name":"time_created","base":"uint32","bsize":4,"convert":"timestamp"},"5":{"name":"number","base":"uint16","bsize":2},"8":{"name":"product_name","base":"string","bsize":1}},"file_creator":{"0":{"name":"software_version","base":"uint16","bsize":2},"1":{"name":"hardware_version","base":"uint8","bsize":1}},"timestamp_correlation":{"253":{"name":"timestamp","base":"uint32","bsize":4,"unit":"s","convert":"timestamp"},"0":{"name":"fractional_timestamp","base":"uint16","bsize":2,"unit":"s","scale":32768},"1":{"name":"system_timestamp","base":"uint32","bsize":4,"unit":"s","convert":"timestamp"},"2":{"name":"fractional_system_timestamp","base":"uint16","bsize":2,"unit":"s","scale":32768},"3":{"name":"local_timestamp","base":"uint32","bsize":4,"unit":"s","convert":"timestamp"},"4":{"name":"timestamp_ms","base":"uint16","bsize":2,"unit":"ms"},"5":{"name":"system_timestamp_ms","base":"uint16","bsize":2,"unit":"ms"}},"software":{"254":{"name":"message_index","base":"uint16","bsize":2},"3":{"name":"version","base":"uint16","bsize":2,"scale":100},"5":{"name":"part_number","base":"string","bsize":1}},"capabilities":{"0":{"name":"languages"},"1":{"name":"sports"},"21":{"name":"workouts_supported","base":"uint32z","bsize":4},"23":{"name":"connectivity_supported","base":"uint32z","bsize":4}},"device_settings":{"0":{"name":"active_time_zone","base":"uint8","bsize":1},"1":{"name":"utc_offset","base":"uint32","bsize":4},"2":{"name":"time_offset","base":"uint32","bsize":4,"unit":"s"},"4":{"name":"time_mode"},"5":{"name":"time_zone_offset","base":"sint8","bsize":1,"unit":"hr","scale":4},"12":{"name":"backlight_mode"},"36":{"name":"activity_tracker_enabled"},"39":{"name":"clock_time","base":"uint32","bsize":4,"convert":"timestamp"},"40":{"name":"pages_enabled","base":"uint16","bsize":2},"46":{"name":"move_alert_enabled"},"47":{"name":"date_mode"},"55":{"name":"display_orientation"},"56":{"name":"mounting_side"},"57":{"name":"default_page","base":"uint16","bsize":2},"58":{"name":"autosync_min_steps","base":"uint16","bsize":2,"unit":"steps"},"59":{"name":"autosync_min_time","base":"uint16","bsize":2,"unit":"minutes"},"80":{"name":"lactate_threshold_autodetect_enabled"},"86":{"name":"ble_auto_upload_enabled"},"89":{"name":"auto_sync_frequency"},"90":{"name":"auto_activity_detect","base":"uint32","bsize":4},"94":{"name":"number_of_screens","base":"uint8","bsize":1},"95":{"name":"smart_notification_display_orientation"},"134":{"name":"tap_interface"},"174":{"name":"tap_sensitivity"}},"user_profile":{"254":{"name":"message_index","base":"uint16","bsize":2},"0":{"name":"friendly_name","base":"string","bsize":1},"1":{"name":"gender"},"2":{"name":"age","base":"uint8","bsize":1,"unit":"years"},"3":{"name":"height","base":"uint8","bsize":1,"unit":"m","scale":100},"4":{"name":"weight","base":"uint16","bsize":2,"unit":"kg","scale":10},"5":{"name":"language"},"6":{"name":"elev_setting"},"7":{"name":"weight_setting"},"8":{"name":"resting_heart_rate","base":"uint8","bsize":1,"unit":"bpm"},"9":{"name":"default_max_running_heart_rate","base":"uint8","bsize":1,"unit":"bpm"},"10":{"name":"default_max_biking_heart_rate","base":"uint8","bsize":1,"unit":"bpm"},"11":{"name":"default_max_heart_rate","base":"uint8","bsize":1,"unit":"bpm"},"12":{"name":"hr_setting"},"13":{"name":"speed_setting"},"14":{"name":"dist_setting"},"16":{"name":"power_setting"},"17":{"name":"activity_class"},"18":{"name":"position_setting"},"21":{"name":"temperature_setting"},"22":{"name":"local_id","base":"uint16","bsize":2},"23":{"name":"global_id","base":"byte","bsize":1},"28":{"name":"wake_time","base":"uint32","bsize":4},"29":{"name":"sleep_time","base":"uint32","bsize":4},"30":{"name":"height_setting"},"31":{"name":"user_running_step_length","base":"uint16","bsize":2,"unit":"m","scale":1000},"32":{"name":"user_walking_step_length","base":"uint16","bsize":2,"unit":"m","scale":1000},"47":{"name":"depth_setting"},"49":{"name":"dive_count","base":"uint32","bsize":4}},"ohr_settings":{"253":{"name":"timestamp","base":"uint32","bsize":4,"unit":"s","convert":"timestamp"},"0":{"name":"enabled"}},"time_in_zone":{"253":{"name":"timestamp","base":"uint32","bsize":4,"unit":"s","convert":"timestamp"},"0":{"name":"reference_mesg","base":"uint16","bsize":2},"1":{"name":"reference_index","base":"uint16","bsize":2},"2":{"name":"time_in_hr_zone","base":"uint32","bsize":4,"unit":"s","scale":1000},"3":{"name":"time_in_speed_zone","base":"uint32","bsize":4,"unit":"s","scale":1000},"4":{"name":"time_in_cadence_zone","base":"uint32","bsize":4,"unit":"s","scale":1000},"5":{"name":"time_in_power_zone","base":"uint32","bsize":4,"unit":"s","scale":1000},"6":{"name":"hr_zone_high_boundary","base":"uint8","bsize":1,"unit":"bpm"},"7":{"name":"speed_zone_high_boundary","base":"uint16","bsize":2,"unit":"m/s","scale":1000},"8":{"name":"cadence_zone_high_bondary","base":"uint8","bsize":1,"unit":"rpm"},"9":{"name":"power_zone_high_boundary","base":"uint16","bsize":2,"unit":"watts"},"10":{"name":"hr_calc_type"},"11":{"name":"max_heart_rate","base":"uint8","bsize":1},"12":{"name":"resting_heart_rate","base":"uint8","bsize":1},"13":{"name":"threshold_heart_rate","base":"uint8","bsize":1},"14":{"name":"pwr_calc_type"},"15":{"name":"functional_threshold_power","base":"uint16","bsize":2}},"zones_target":{"1":{"name":"max_heart_rate","base":"uint8","bsize":1},"2":{"name":"threshold_heart_rate","base":"uint8","bsize":1},"3":{"name":"functional_threshold_power","base":"uint16","bsize":2},"5":{"name":"hr_calc_type"},"7":{"name":"pwr_calc_type"}},"sport":{"0":{"name":"sport"},"1":{"name":"sub_sport"},"3":{"name":"name","base":"string","bsize":1}},"hr_zone":{"254":{"name":"message_index","base":"uint16","bsize":2},"1":{"name":"high_bpm","base":"uint8","bsize":1,"unit":"bpm"},"2":{"name":"name","base":"string","bsize":1}},"training_settings":{"31":{"name":"target_distance","base":"uint32","bsize":4,"unit":"m","scale":100},"32":{"name":"target_speed","base":"uint16","bsize":2,"unit":"m/s","scale":1000},"33":{"name":"target_time","base":"uint32","bsize":4,"unit":"s"},"153":{"name":"precise_target_speed","base":"uint32","bsize":4,"unit":"m/s","scale":1000000}},"goal":{"254":{"name":"message_index","base":"uint16","bsize":2},"0":{"name":"sport"},"1":{"name":"sub_sport"},"2":{"name":"start_date","base":"uint32","bsize":4,"convert":"timestamp"},"3":{"name":"end_date","base":"uint32","bsize":4,"convert":"timestamp"},"4":{"name":"type"},"5":{"name":"value","base":"uint32","bsize":4},"6":{"name":"repeat"},"7":{"name":"target_value","base":"uint32","bsize":4},"8":{"name":"recurrence"},"9":{"name":"recurrence_value","base":"uint16","bsize":2},"10":{"name":"enabled"},"11":{"name":"source"}},"activity":{"253":{"name":"timestamp","base":"uint32","bsize":4,"convert":"timestamp"},"0":{"name":"total_timer_time","base":"uint32","bsize":4,"unit":"s","scale":1000},"1":{"name":"num_sessions","base":"uint16","bsize":2},"2":{"name":"type"},"3":{"name":"event"},"4":{"name":"event_type"},"5":{"name":"local_timestamp","base":"uint32","bsize":4,"convert":"timestamp"},"6":{"name":"event_group","base":"uint8","bsize":1}},"session":{"254":{"name":"message_index","base":"uint16","bsize":2},"253":{"name":"timestamp","base":"uint32","bsize":4,"unit":"s","convert":"timestamp"},"0":{"name":"event"},"1":{"name":"event_type"},"2":{"name":"start_time","base":"uint32","bsize":4,"convert":"timestamp"},"3":{"name":"start_position_lat","base":"sint32","bsize":4,"unit":"semicircles","convert":"semicircles"},"4":{"name":"start_position_long","base":"sint32","bsize":4,"unit":"semicircles","convert":"semicircles"},"5":{"name":"sport"},"6":{"name":"sub_sport"},"7":{"name":"total_elapsed_time","base":"uint32","bsize":4,"unit":"s","scale":1000},"8":{"name":"total_timer_time","base":"uint32","bsize":4,"unit":"s","scale":1000},"9":{"name":"total_distance","base":"uint32","bsize":4,"unit":"m","scale":100},"10":{"name":"total_cycles","base":"uint32","bsize":4,"unit":"cycles"},"11":{"name":"total_calories","base":"uint16","bsize":2,"unit":"kcal"},"13":{"name":"total_fat_calories","base":"uint16","bsize":2,"unit":"kcal"},"14":{"name":"avg_speed","base":"uint16","bsize":2,"unit":"m/s","scale":1000},"15":{"name":"max_speed","base":"uint16","bsize":2,"unit":"m/s","scale":1000},"16":{"name":"avg_heart_rate","base":"uint8","bsize":1,"unit":"bpm"},"17":{"name":"max_heart_rate","base":"uint8","bsize":1,"unit":"bpm"},"18":{"name":"avg_cadence","base":"uint8","bsize":1,"unit":"rpm"},"19":{"name":"max_cadence","base":"uint8","bsize":1,"unit":"rpm"},"20":{"name":"avg_power","base":"uint16","bsize":2,"unit":"watts"},"21":{"name":"max_power","base":"uint16","bsize":2,"unit":"watts"},"22":{"name":"total_ascent","base":"uint16","bsize":2,"unit":"m"},"23":{"name":"total_descent","base":"uint16","bsize":2,"unit":"m"},"24":{"name":"total_training_effect","base":"uint8","bsize":1,"scale":10},"25":{"name":"first_lap_index","base":"uint16","bsize":2},"26":{"name":"num_laps","base":"uint16","bsize":2},"27":{"name":"event_group","base":"uint8","bsize":1},"28":{"name":"trigger"},"29":{"name":"nec_lat","base":"sint32","bsize":4,"unit":"semicircles","convert":"semicircles"},"30":{"name":"nec_long","base":"sint32","bsize":4,"unit":"semicircles","convert":"semicircles"},"31":{"name":"swc_lat","base":"sint32","bsize":4,"unit":"semicircles","convert":"semicircles"},"32":{"name":"swc_long","base":"sint32","bsize":4,"unit":"semicircles","convert":"semicircles"},"33":{"name":"num_lengths","base":"uint16","bsize":2,"unit":"lengths"},"34":{"name":"normalized_power","base":"uint16","bsize":2,"unit":"watts"},"35":{"name":"training_stress_score","base":"uint16","bsize":2,"unit":"tss","scale":10},"36":{"name":"intensity_factor","base":"uint16","bsize":2,"unit":"if","scale":1000},"37":{"name":"left_right_balance","base":"uint16","bsize":2},"38":{"name":"end_position_lat","base":"sint32","bsize":4,"unit":"semicircles","convert":"semicircles"},"39":{"name":"end_position_long","base":"sint32","bsize":4,"unit":"semicircles","convert":"semicircles"},"41":{"name":"avg_stroke_count","base":"uint32","bsize":4,"unit":"strokes/lap","scale":10},"42":{"name":"avg_stroke_distance","base":"uint16","bsize":2,"unit":"m","scale":100},"43":{"name":"swim_stroke","unit":"swim_stroke"},"44":{"name":"pool_length","base":"uint16","bsize":2,"unit":"m","scale":100},"45":{"name":"threshold_power","base":"uint16","bsize":2,"unit":"watts"},"46":{"name":"pool_length_unit"},"47":{"name":"num_active_lengths","base":"uint16","bsize":2,"unit":"lengths"},"48":{"name":"total_work","base":"uint32","bsize":4,"unit":"J"},"49":{"name":"avg_altitude","base":"uint16","bsize":2,"unit":"m","scale":5,"offset":500},"50":{"name":"max_altitude","base":"uint16","bsize":2,"unit":"m","scale":5,"offset":500},"51":{"name":"gps_accuracy","base":"uint8","bsize":1,"unit":"m"},"52":{"name":"avg_grade","base":"sint16","bsize":2,"unit":"%","scale":100},"53":{"name":"avg_pos_grade","base":"sint16","bsize":2,"unit":"%","scale":100},"54":{"name":"avg_neg_grade","base":"sint16","bsize":2,"unit":"%","scale":100},"55":{"name":"max_pos_grade","base":"sint16","bsize":2,"unit":"%","scale":100},"56":{"name":"max_neg_grade","base":"sint16","bsize":2,"unit":"%","scale":100},"57":{"name":"avg_temperature","base":"sint8","bsize":1,"unit":"C"},"58":{"name":"max_temperature","base":"sint8","bsize":1,"unit":"C"},"59":{"name":"total_moving_time","base":"uint32","bsize":4,"unit":"s","scale":1000},"60":{"name":"avg_pos_vertical_speed","base":"sint16","bsize":2,"unit":"m/s","scale":1000},"61":{"name":"avg_neg_vertical_speed","base":"sint16","bsize":2,"unit":"m/s","scale":1000},"62":{"name":"max_pos_vertical_speed","base":"sint16","bsize":2,"unit":"m/s","scale":1000},"63":{"name":"max_neg_vertical_speed","base":"sint16","bsize":2,"unit":"m/s","scale":1000},"64":{"name":"min_heart_rate","base":"uint8","bsize":1,"unit":"bpm"},"65":{"name":"time_in_hr_zone","base":"uint32","bsize":4,"unit":"s","scale":1000},"66":{"name":"time_in_speed_zone","base":"uint32","bsize":4,"unit":"s","scale":1000},"67":{"name":"time_in_cadence_zone","base":"uint32","bsize":4,"unit":"s","scale":1000},"68":{"name":"time_in_power_zone","base":"uint32","bsize":4,"unit":"s","scale":1000},"69":{"name":"avg_lap_time","base":"uint32","bsize":4,"unit":"s","scale":1000},"70":{"name":"best_lap_index","base":"uint16","bsize":2},"71":{"name":"min_altitude","base":"uint16","bsize":2,"unit":"m","scale":5,"offset":500},"78":{"name":"active_time","base":"uint32","bsize":4,"unit":"s","scale":1000},"79":{"name":"avg_strokes_per_length","base":"uint16","bsize":2,"unit":"strokes/length","scale":10},"80":{"name":"avg_swolf","base":"uint16","bsize":2},"82":{"name":"player_score","base":"uint16","bsize":2},"83":{"name":"opponent_score","base":"uint16","bsize":2},"84":{"name":"opponent_name","base":"string","bsize":1},"85":{"name":"stroke_count","base":"uint16","bsize":2,"unit":"counts"},"86":{"name":"zone_count","base":"uint16","bsize":2,"unit":"counts"},"87":{"name":"max_ball_speed","base":"uint16","bsize":2,"unit":"m/s","scale":100},"88":{"name":"avg_ball_speed","base":"uint16","bsize":2,"unit":"m/s","scale":100},"89":{"name":"avg_vertical_oscillation","base":"uint16","bsize":2,"unit":"mm","scale":10},"90":{"name":"avg_stance_time_percent","base":"uint16","bsize":2,"unit":"percent","scale":100},"91":{"name":"avg_stance_time","base":"uint16","bsize":2,"unit":"ms","scale":10},"92":{"name":"avg_fractional_cadence","base":"uint8","bsize":1,"unit":"rpm","scale":128},"93":{"name":"max_fractional_cadence","base":"uint8","bsize":1,"unit":"rpm","scale":128},"94":{"name":"total_fractional_cycles","base":"uint8","bsize":1,"unit":"cycles","scale":128},"95":{"name":"avg_total_hemoglobin_conc","base":"uint16","bsize":2,"unit":"g/dL","scale":100},"96":{"name":"min_total_hemoglobin_conc","base":"uint16","bsize":2,"unit":"g/dL","scale":100},"97":{"name":"max_total_hemoglobin_conc","base":"uint16","bsize":2,"unit":"g/dL","scale":100},"98":{"name":"avg_saturated_hemoglobin_percent","base":"uint16","bsize":2,"unit":"%","scale":10},"99":{"name":"min_saturated_hemoglobin_percent","base":"uint16","bsize":2,"unit":"%","scale":10},"100":{"name":"max_saturated_hemoglobin_percent","base":"uint16","bsize":2,"unit":"%","scale":10},"101":{"name":"avg_left_torque_effectiveness","base":"uint8","bsize":1,"unit":"percent","scale":2},"102":{"name":"avg_right_torque_effectiveness","base":"uint8","bsize":1,"unit":"percent","scale":2},"103":{"name":"avg_left_pedal_smoothness","base":"uint8","bsize":1,"unit":"percent","scale":2},"104":{"name":"avg_right_pedal_smoothness","base":"uint8","bsize":1,"unit":"percent","scale":2},"105":{"name":"avg_combined_pedal_smoothness","base":"uint8","bsize":1,"unit":"percent","scale":2},"106":{"name":"num_segment_laps","base":"uint16","bsize":2},"107":{"name":"front_gear_shift_count","base":"uint16","bsize":2},"108":{"name":"rear_gear_shift_count","base":"uint16","bsize":2},"110":{"name":"sport_profile_name","base":"string","bsize":1},"111":{"name":"sport_index","base":"uint8","bsize":1},"112":{"name":"time_standing","base":"uint32","bsize":4,"unit":"s","scale":1000},"113":{"name":"stand_count","base":"uint16","bsize":2},"114":{"name":"avg_left_pco","base":"sint8","bsize":1,"unit":"mm"},"115":{"name":"avg_right_pco","base":"sint8","bsize":1,"unit":"mm"},"116":{"name":"avg_left_power_phase","base":"uint8","bsize":1,"unit":"degrees","scale":0.7111111},"117":{"name":"avg_left_power_phase_peak","base":"uint8","bsize":1,"unit":"degrees","scale":0.7111111},"118":{"name":"avg_right_power_phase","base":"uint8","bsize":1,"unit":"degrees","scale":0.7111111},"119":{"name":"avg_right_power_phase_peak","base":"uint8","bsize":1,"unit":"degrees","scale":0.7111111},"120":{"name":"avg_power_position","base":"uint16","bsize":2,"unit":"watts"},"121":{"name":"max_power_position","base":"uint16","bsize":2,"unit":"watts"},"122":{"name":"avg_cadence_position","base":"uint8","bsize":1,"unit":"rpm"},"123":{"name":"max_cadence_position","base":"uint8","bsize":1,"unit":"rpm"},"124":{"name":"enhanced_avg_speed","base":"uint32","bsize":4,"unit":"m/s","scale":1000},"125":{"name":"enhanced_max_speed","base":"uint32","bsize":4,"unit":"m/s","scale":1000},"126":{"name":"enhanced_avg_altitude","base":"uint32","bsize":4,"unit":"m","scale":5,"offset":500},"127":{"name":"enhanced_min_altitude","base":"uint32","bsize":4,"unit":"m","scale":5,"offset":500},"128":{"name":"enhanced_max_altitude","base":"uint32","bsize":4,"unit":"m","scale":5,"offset":500},"129":{"name":"avg_lev_motor_power","base":"uint16","bsize":2,"unit":"watts"},"130":{"name":"max_lev_motor_power","base":"uint16","bsize":2,"unit":"watts"},"131":{"name":"lev_battery_consumption","base":"uint8","bsize":1,"unit":"percent","scale":2},"132":{"name":"avg_vertical_ratio","base":"uint16","bsize":2,"unit":"percent","scale":100},"133":{"name":"avg_stance_time_balance","base":"uint16","bsize":2,"unit":"percent","scale":100},"134":{"name":"avg_step_length","base":"uint16","bsize":2,"unit":"mm","scale":10},"137":{"name":"total_anaerobic_training_effect","base":"uint8","bsize":1,"scale":10},"139":{"name":"avg_vam","base":"uint16","bsize":2,"unit":"m/s","scale":1000},"140":{"name":"avg_depth","base":"uint32","bsize":4,"unit":"m","scale":1000},"141":{"name":"max_depth","base":"uint32","bsize":4,"unit":"m","scale":1000},"142":{"name":"surface_interval","base":"uint32","bsize":4,"unit":"s"},"143":{"name":"start_cns","base":"uint8","bsize":1,"unit":"percent"},"144":{"name":"end_cns","base":"uint8","bsize":1,"unit":"percent"},"145":{"name":"start_n2","base":"uint16","bsize":2,"unit":"percent"},"146":{"name":"end_n2","base":"uint16","bsize":2,"unit":"percent"},"147":{"name":"avg_respiration_rate","base":"uint8","bsize":1,"unit":""},"148":{"name":"max_respiration_rate","base":"uint8","bsize":1,"unit":""},"149":{"name":"min_respiration_rate","base":"uint8","bsize":1,"unit":""},"150":{"name":"min_temperature","base":"sint8","bsize":1,"unit":"C"},"155":{"name":"o2_toxicity","base":"uint16","bsize":2,"unit":"OTUs"},"156":{"name":"dive_number","base":"uint32","bsize":4},"168":{"name":"training_load_peak","base":"sint32","bsize":4,"scale":65536},"169":{"name":"enhanced_avg_respiration_rate","base":"uint16","bsize":2,"unit":"Breaths/min","scale":100},"170":{"name":"enhanced_max_respiration_rate","base":"uint16","bsize":2,"unit":"Breaths/min","scale":100},"180":{"name":"enhanced_min_respiration_rate","base":"uint16","bsize":2,"scale":100},"181":{"name":"total_grit","base":"float32","bsize":4,"unit":"kGrit"},"182":{"name":"total_flow","base":"float32","bsize":4,"unit":"Flow"},"183":{"name":"jump_count","base":"uint16","bsize":2},"186":{"name":"avg_grit","base":"float32","bsize":4,"unit":"kGrit"},"187":{"name":"avg_flow","base":"float32","bsize":4,"unit":"Flow"},"192":{"name":"workout_feel","base":"uint8","bsize":1},"193":{"name":"workout_rpe","base":"uint8","bsize":1},"194":{"name":"avg_spo2","base":"uint8","bsize":1,"unit":"percent"},"195":{"name":"avg_stress","base":"uint8","bsize":1,"unit":"percent"},"196":{"name":"metabolic_calories","base":"uint16","bsize":2,"unit":"kcal"},"197":{"name":"sdrr_hrv","base":"uint8","bsize":1,"unit":"mS"},"198":{"name":"rmssd_hrv","base":"uint8","bsize":1,"unit":"mS"},"199":{"name":"total_fractional_ascent","base":"uint8","bsize":1,"unit":"m","scale":100},"200":{"name":"total_fractional_descent","base":"uint8","bsize":1,"unit":"m","scale":100},"208":{"name":"avg_core_temperature","base":"uint16","bsize":2,"unit":"C","scale":100},"209":{"name":"min_core_temperature","base":"uint16","bsize":2,"unit":"C","scale":100},"210":{"name":"max_core_temperature","base":"uint16","bsize":2,"unit":"C","scale":100},"211":{"name":"avg_grade_adjusted_speed","base":"uint32","bsize":4,"unit":"m/s","scale":1000}},"lap":{"254":{"name":"message_index","base":"uint16","bsize":2},"253":{"name":"timestamp","base":"uint32","bsize":4,"unit":"s","convert":"timestamp"},"0":{"name":"event"},"1":{"name":"event_type"},"2":{"name":"start_time","base":"uint32","bsize":4,"convert":"timestamp"},"3":{"name":"start_position_lat","base":"sint32","bsize":4,"unit":"semicircles","convert":"semicircles"},"4":{"name":"start_position_long","base":"sint32","bsize":4,"unit":"semicircles","convert":"semicircles"},"5":{"name":"end_position_lat","base":"sint32","bsize":4,"unit":"semicircles","convert":"semicircles"},"6":{"name":"end_position_long","base":"sint32","bsize":4,"unit":"semicircles","convert":"semicircles"},"7":{"name":"total_elapsed_time","base":"uint32","bsize":4,"unit":"s","scale":1000},"8":{"name":"total_timer_time","base":"uint32","bsize":4,"unit":"s","scale":1000},"9":{"name":"total_distance","base":"uint32","bsize":4,"unit":"m","scale":100},"10":{"name":"total_cycles","base":"uint32","bsize":4,"unit":"cycles"},"11":{"name":"total_calories","base":"uint16","bsize":2,"unit":"kcal"},"12":{"name":"total_fat_calories","base":"uint16","bsize":2,"unit":"kcal"},"13":{"name":"avg_speed","base":"uint16","bsize":2,"unit":"m/s","scale":1000},"14":{"name":"max_speed","base":"uint16","bsize":2,"unit":"m/s","scale":1000},"15":{"name":"avg_heart_rate","base":"uint8","bsize":1,"unit":"bpm"},"16":{"name":"max_heart_rate","base":"uint8","bsize":1,"unit":"bpm"},"17":{"name":"avg_cadence","base":"uint8","bsize":1,"unit":"rpm"},"18":{"name":"max_cadence","base":"uint8","bsize":1,"unit":"rpm"},"19":{"name":"avg_power","base":"uint16","bsize":2,"unit":"watts"},"20":{"name":"max_power","base":"uint16","bsize":2,"unit":"watts"},"21":{"name":"total_ascent","base":"uint16","bsize":2,"unit":"m"},"22":{"name":"total_descent","base":"uint16","bsize":2,"unit":"m"},"23":{"name":"intensity"},"24":{"name":"lap_trigger"},"25":{"name":"sport"},"26":{"name":"event_group","base":"uint8","bsize":1},"27":{"name":"nec_lat","base":"sint32","bsize":4,"unit":"semicircles","convert":"semicircles"},"28":{"name":"nec_long","base":"sint32","bsize":4,"unit":"semicircles","convert":"semicircles"},"29":{"name":"swc_lat","base":"sint32","bsize":4,"unit":"semicircles","convert":"semicircles"},"30":{"name":"swc_long","base":"sint32","bsize":4,"unit":"semicircles","convert":"semicircles"},"32":{"name":"num_lengths","base":"uint16","bsize":2,"unit":"lengths"},"33":{"name":"normalized_power","base":"uint16","bsize":2,"unit":"watts"},"34":{"name":"left_right_balance","base":"uint16","bsize":2},"35":{"name":"first_length_index","base":"uint16","bsize":2},"37":{"name":"avg_stroke_distance","base":"uint16","bsize":2,"unit":"m","scale":100},"38":{"name":"swim_stroke"},"39":{"name":"sub_sport"},"40":{"name":"num_active_lengths","base":"uint16","bsize":2,"unit":"lengths"},"41":{"name":"total_work","base":"uint32","bsize":4,"unit":"J"},"42":{"name":"avg_altitude","base":"uint16","bsize":2,"unit":"m","scale":5,"offset":500},"43":{"name":"max_altitude","base":"uint16","bsize":2,"unit":"m","scale":5,"offset":500},"44":{"name":"gps_accuracy","base":"uint8","bsize":1,"unit":"m"},"45":{"name":"avg_grade","base":"sint16","bsize":2,"unit":"%","scale":100},"46":{"name":"avg_pos_grade","base":"sint16","bsize":2,"unit":"%","scale":100},"47":{"name":"avg_neg_grade","base":"sint16","bsize":2,"unit":"%","scale":100},"48":{"name":"max_pos_grade","base":"sint16","bsize":2,"unit":"%","scale":100},"49":{"name":"max_neg_grade","base":"sint16","bsize":2,"unit":"%","scale":100},"50":{"name":"avg_temperature","base":"sint8","bsize":1,"unit":"C"},"51":{"name":"max_temperature","base":"sint8","bsize":1,"unit":"C"},"52":{"name":"total_moving_time","base":"uint32","bsize":4,"unit":"s","scale":1000},"53":{"name":"avg_pos_vertical_speed","base":"sint16","bsize":2,"unit":"m/s","scale":1000},"54":{"name":"avg_neg_vertical_speed","base":"sint16","bsize":2,"unit":"m/s","scale":1000},"55":{"name":"max_pos_vertical_speed","base":"sint16","bsize":2,"unit":"m/s","scale":1000},"56":{"name":"max_neg_vertical_speed","base":"sint16","bsize":2,"unit":"m/s","scale":1000},"57":{"name":"time_in_hr_zone","base":"uint32","bsize":4,"unit":"s","scale":1000},"58":{"name":"time_in_speed_zone","base":"uint32","bsize":4,"unit":"s","scale":1000},"59":{"name":"time_in_cadence_zone","base":"uint32","bsize":4,"unit":"s","scale":1000},"60":{"name":"time_in_power_zone","base":"uint32","bsize":4,"unit":"s","scale":1000},"61":{"name":"repetition_num","base":"uint16","bsize":2},"62":{"name":"min_altitude","base":"uint16","bsize":2,"unit":"m","scale":5,"offset":500},"63":{"name":"min_heart_rate","base":"uint8","bsize":1,"unit":"bpm"},"70":{"name":"active_time","base":"uint32","bsize":4,"unit":"s","scale":1000},"71":{"name":"wkt_step_index","base":"uint16","bsize":2},"73":{"name":"avg_swolf","base":"uint16","bsize":2},"74":{"name":"opponent_score","base":"uint16","bsize":2},"75":{"name":"stroke_count","base":"uint16","bsize":2,"unit":"counts"},"76":{"name":"zone_count","base":"uint16","bsize":2,"unit":"counts"},"77":{"name":"avg_vertical_oscillation","base":"uint16","bsize":2,"unit":"mm","scale":10},"78":{"name":"avg_stance_time_percent","base":"uint16","bsize":2,"unit":"percent","scale":100},"79":{"name":"avg_stance_time","base":"uint16","bsize":2,"unit":"ms","scale":10},"80":{"name":"avg_fractional_cadence","base":"uint8","bsize":1,"unit":"rpm","scale":128},"81":{"name":"max_fractional_cadence","base":"uint8","bsize":1,"unit":"rpm","scale":128},"82":{"name":"total_fractional_cycles","base":"uint8","bsize":1,"unit":"cycles","scale":128},"83":{"name":"player_score","base":"uint16","bsize":2},"84":{"name":"avg_total_hemoglobin_conc","base":"uint16","bsize":2,"unit":"g/dL","scale":100},"85":{"name":"min_total_hemoglobin_conc","base":"uint16","bsize":2,"unit":"g/dL","scale":100},"86":{"name":"max_total_hemoglobin_conc","base":"uint16","bsize":2,"unit":"g/dL","scale":100},"87":{"name":"avg_saturated_hemoglobin_percent","base":"uint16","bsize":2,"unit":"%","scale":10},"88":{"name":"min_saturated_hemoglobin_percent","base":"uint16","bsize":2,"unit":"%","scale":10},"89":{"name":"max_saturated_hemoglobin_percent","base":"uint16","bsize":2,"unit":"%","scale":10},"90":{"name":"avg_strokes_per_length","base":"uint16","bsize":2,"unit":"strokes / length","scale":10},"91":{"name":"avg_left_torque_effectiveness","base":"uint8","bsize":1,"unit":"percent","scale":2},"92":{"name":"avg_right_torque_effectiveness","base":"uint8","bsize":1,"unit":"percent","scale":2},"93":{"name":"avg_left_pedal_smoothness","base":"uint8","bsize":1,"unit":"percent","scale":2},"94":{"name":"avg_right_pedal_smoothness","base":"uint8","bsize":1,"unit":"percent","scale":2},"95":{"name":"avg_combined_pedal_smoothness","base":"uint8","bsize":1,"unit":"percent","scale":2},"96":{"name":"front_gear_shift_count","base":"uint16","bsize":2},"97":{"name":"rear_gear_shift_count","base":"uint16","bsize":2},"98":{"name":"time_standing","base":"uint32","bsize":4,"unit":"s","scale":1000},"99":{"name":"stand_count","base":"uint16","bsize":2},"100":{"name":"avg_left_pco","base":"sint8","bsize":1,"unit":"mm"},"101":{"name":"avg_right_pco","base":"sint8","bsize":1,"unit":"mm"},"102":{"name":"avg_left_power_phase","base":"uint8","bsize":1,"unit":"degrees","scale":0.7111111},"103":{"name":"avg_left_power_phase_peak","base":"uint8","bsize":1,"unit":"degrees","scale":0.7111111},"104":{"name":"avg_right_power_phase","base":"uint8","bsize":1,"unit":"degrees","scale":0.7111111},"105":{"name":"avg_right_power_phase_peak","base":"uint8","bsize":1,"unit":"degrees","scale":0.7111111},"106":{"name":"avg_power_position","base":"uint16","bsize":2,"unit":"watts"},"107":{"name":"max_power_position","base":"uint16","bsize":2,"unit":"watts"},"108":{"name":"avg_cadence_position","base":"uint8","bsize":1,"unit":"rpm"},"109":{"name":"max_cadence_position","base":"uint8","bsize":1,"unit":"rpm"},"110":{"name":"enhanced_avg_speed","base":"uint32","bsize":4,"unit":"m/s","scale":1000},"111":{"name":"enhanced_max_speed","base":"uint32","bsize":4,"unit":"m/s","scale":1000},"112":{"name":"enhanced_avg_altitude","base":"uint32","bsize":4,"unit":"m","scale":5,"offset":500},"113":{"name":"enhanced_min_altitude","base":"uint32","bsize":4,"unit":"m","scale":5,"offset":500},"114":{"name":"enhanced_max_altitude","base":"uint32","bsize":4,"unit":"m","scale":5,"offset":500},"115":{"name":"avg_lev_motor_power","base":"uint16","bsize":2,"unit":"watts"},"116":{"name":"max_lev_motor_power","base":"uint16","bsize":2,"unit":"watts"},"117":{"name":"lev_battery_consumption","base":"uint8","bsize":1,"unit":"percent","scale":2},"118":{"name":"avg_vertical_ratio","base":"uint16","bsize":2,"unit":"percent","scale":100},"119":{"name":"avg_stance_time_balance","base":"uint16","bsize":2,"unit":"percent","scale":100},"120":{"name":"avg_step_length","base":"uint16","bsize":2,"unit":"mm","scale":10},"121":{"name":"avg_vam","base":"uint16","bsize":2,"unit":"m/s","scale":1000},"122":{"name":"avg_depth","base":"uint32","bsize":4,"unit":"m","scale":1000},"123":{"name":"max_depth","base":"uint32","bsize":4,"unit":"m","scale":1000},"124":{"name":"min_temperature","base":"sint8","bsize":1,"unit":"C"},"136":{"name":"enhanced_avg_respiration_rate","base":"uint16","bsize":2,"unit":"Breaths/min","scale":100},"137":{"name":"enhanced_max_respiration_rate","base":"uint16","bsize":2,"unit":"Breaths/min","scale":100},"147":{"name":"avg_respiration_rate","base":"uint8","bsize":1,"unit":""},"148":{"name":"max_respiration_rate","base":"uint8","bsize":1,"unit":""},"149":{"name":"total_grit","base":"float32","bsize":4,"unit":"kGrit"},"150":{"name":"total_flow","base":"float32","bsize":4,"unit":"Flow"},"151":{"name":"jump_count","base":"uint16","bsize":2},"153":{"name":"avg_grit","base":"float32","bsize":4,"unit":"kGrit"},"154":{"name":"avg_flow","base":"float32","bsize":4,"unit":"Flow"},"155":{"name":"metabolic_calories","base":"uint16","bsize":2,"unit":"kcal"},"156":{"name":"total_fractional_ascent","base":"uint8","bsize":1,"unit":"m","scale":100},"157":{"name":"total_fractional_descent","base":"uint8","bsize":1,"unit":"m","scale":100},"158":{"name":"avg_core_temperature","base":"uint16","bsize":2,"unit":"C","scale":100},"159":{"name":"min_core_temperature","base":"uint16","bsize":2,"unit":"C","scale":100},"160":{"name":"max_core_temperature","base":"uint16","bsize":2,"unit":"C","scale":100},"161":{"name":"avg_grade_adjusted_speed","base":"uint32","bsize":4,"unit":"m/s","scale":1000}},"record":{"253":{"name":"timestamp","base":"uint32","bsize":4,"unit":"s","convert":"timestamp"},"0":{"name":"position_lat","base":"sint32","bsize":4,"unit":"semicircles","convert":"semicircles"},"1":{"name":"position_long","base":"sint32","bsize":4,"unit":"semicircles","convert":"semicircles"},"2":{"name":"altitude","base":"uint16","bsize":2,"unit":"m","scale":5,"offset":500},"3":{"name":"heart_rate","base":"uint8","bsize":1,"unit":"bpm"},"4":{"name":"cadence","base":"uint8","bsize":1,"unit":"rpm"},"5":{"name":"distance","base":"uint32","bsize":4,"unit":"m","scale":100},"6":{"name":"speed","base":"uint16","bsize":2,"unit":"m/s","scale":1000},"7":{"name":"power","base":"uint16","bsize":2,"unit":"watts"},"8":{"name":"compressed_speed_distance","base":"byte","bsize":1,"unit":"m/s","scale":100},"9":{"name":"grade","base":"sint16","bsize":2,"unit":"%","scale":100},"10":{"name":"resistance","base":"uint8","bsize":1},"11":{"name":"time_from_course","base":"sint32","bsize":4,"unit":"s","scale":1000},"12":{"name":"cycle_length","base":"uint8","bsize":1,"unit":"m","scale":100},"13":{"name":"temperature","base":"sint8","bsize":1,"unit":"C"},"17":{"name":"speed_1s","base":"uint8","bsize":1,"unit":"m/s","scale":16},"18":{"name":"cycles","base":"uint8","bsize":1,"unit":"cycles"},"19":{"name":"total_cycles","base":"uint32","bsize":4,"unit":"cycles"},"28":{"name":"compressed_accumulated_power","base":"uint16","bsize":2,"unit":"watts"},"29":{"name":"accumulated_power","base":"uint32","bsize":4,"unit":"watts"},"30":{"name":"left_right_balance","base":"uint8","bsize":1},"31":{"name":"gps_accuracy","base":"uint8","bsize":1,"unit":"m"},"32":{"name":"vertical_speed","base":"sint16","bsize":2,"unit":"m/s","scale":1000},"33":{"name":"calories","base":"uint16","bsize":2,"unit":"kcal"},"39":{"name":"vertical_oscillation","base":"uint16","bsize":2,"unit":"mm","scale":10},"40":{"name":"stance_time_percent","base":"uint16","bsize":2,"unit":"percent","scale":100},"41":{"name":"stance_time","base":"uint16","bsize":2,"unit":"ms","scale":10},"42":{"name":"activity_type"},"43":{"name":"left_torque_effectiveness","base":"uint8","bsize":1,"unit":"percent","scale":2},"44":{"name":"right_torque_effectiveness","base":"uint8","bsize":1,"unit":"percent","scale":2},"45":{"name":"left_pedal_smoothness","base":"uint8","bsize":1,"unit":"percent","scale":2},"46":{"name":"right_pedal_smoothness","base":"uint8","bsize":1,"unit":"percent","scale":2},"47":{"name":"combined_pedal_smoothness","base":"uint8","bsize":1,"unit":"percent","scale":2},"48":{"name":"time128","base":"uint8","bsize":1,"unit":"s","scale":128},"49":{"name":"stroke_type"},"50":{"name":"zone","base":"uint8","bsize":1},"51":{"name":"ball_speed","base":"uint16","bsize":2,"unit":"m/s","scale":100},"52":{"name":"cadence256","base":"uint16","bsize":2,"unit":"rpm","scale":256},"53":{"name":"fractional_cadence","base":"uint8","bsize":1,"unit":"rpm","scale":128},"54":{"name":"total_hemoglobin_conc","base":"uint16","bsize":2,"unit":"g/dL","scale":100},"55":{"name":"total_hemoglobin_conc_min","base":"uint16","bsize":2,"unit":"g/dL","scale":100},"56":{"name":"total_hemoglobin_conc_max","base":"uint16","bsize":2,"unit":"g/dL","scale":100},"57":{"name":"saturated_hemoglobin_percent","base":"uint16","bsize":2,"unit":"%","scale":10},"58":{"name":"saturated_hemoglobin_percent_min","base":"uint16","bsize":2,"unit":"%","scale":10},"59":{"name":"saturated_hemoglobin_percent_max","base":"uint16","bsize":2,"unit":"%","scale":10},"62":{"name":"device_index","base":"uint8","bsize":1},"67":{"name":"left_pco","base":"sint8","bsize":1,"unit":"mm"},"68":{"name":"right_pco","base":"sint8","bsize":1,"unit":"mm"},"69":{"name":"left_power_phase","base":"uint8","bsize":1,"unit":"degrees","scale":0.7111111},"70":{"name":"left_power_phase_peak","base":"uint8","bsize":1,"unit":"degrees","scale":0.7111111},"71":{"name":"right_power_phase","base":"uint8","bsize":1,"unit":"degrees","scale":0.7111111},"72":{"name":"right_power_phase_peak","base":"uint8","bsize":1,"unit":"degrees","scale":0.7111111},"73":{"name":"enhanced_speed","base":"uint32","bsize":4,"unit":"m/s","scale":1000},"78":{"name":"enhanced_altitude","base":"uint32","bsize":4,"unit":"m","scale":5,"offset":500},"81":{"name":"battery_soc","base":"uint8","bsize":1,"unit":"percent","scale":2},"82":{"name":"motor_power","base":"uint16","bsize":2,"unit":"watts"},"83":{"name":"vertical_ratio","base":"uint16","bsize":2,"unit":"percent","scale":100},"84":{"name":"stance_time_balance","base":"uint16","bsize":2,"unit":"percent","scale":100},"85":{"name":"step_length","base":"uint16","bsize":2,"unit":"mm","scale":10},"87":{"name":"cycle_length16","base":"uint16","bsize":2,"unit":"m","scale":100},"91":{"name":"absolute_pressure","base":"uint32","bsize":4,"unit":"Pa"},"92":{"name":"depth","base":"uint32","bsize":4,"unit":"m","scale":1000},"93":{"name":"next_stop_depth","base":"uint32","bsize":4,"unit":"m","scale":1000},"94":{"name":"next_stop_time","base":"uint32","bsize":4,"unit":"s"},"95":{"name":"time_to_surface","base":"uint32","bsize":4,"unit":"s"},"96":{"name":"ndl_time","base":"uint32","bsize":4,"unit":"s"},"97":{"name":"cns_load","base":"uint8","bsize":1,"unit":"percent"},"98":{"name":"n2_load","base":"uint16","bsize":2,"unit":"percent"},"99":{"name":"respiration_rate","base":"uint8","bsize":1,"unit":"s"},"108":{"name":"enhanced_respiration_rate","base":"uint16","bsize":2,"unit":"Breaths/min","scale":100},"114":{"name":"grit","base":"float32","bsize":4},"115":{"name":"flow","base":"float32","bsize":4},"116":{"name":"current_stress","base":"uint16","bsize":2,"scale":100},"117":{"name":"ebike_travel_range","base":"uint16","bsize":2,"unit":"km"},"118":{"name":"ebike_battery_level","base":"uint8","bsize":1,"unit":"percent"},"119":{"name":"ebike_assist_mode","base":"uint8","bsize":1,"unit":"depends on sensor"},"120":{"name":"ebike_assist_level_percent","base":"uint8","bsize":1,"unit":"percent"},"123":{"name":"air_time_remaining","base":"uint32","bsize":4,"unit":"s"},"124":{"name":"pressure_sac","base":"uint16","bsize":2,"unit":"bar/min","scale":100},"125":{"name":"volume_sac","base":"uint16","bsize":2,"unit":"L/min","scale":100},"126":{"name":"rmv","base":"uint16","bsize":2,"unit":"L/min","scale":100},"127":{"name":"ascent_rate","base":"sint32","bsize":4,"unit":"m/s","scale":1000},"129":{"name":"po2","base":"uint8","bsize":1,"unit":"percent","scale":100},"139":{"name":"core_temperature","base":"uint16","bsize":2,"unit":"C","scale":100}},"event":{"253":{"name":"timestamp","base":"uint32","bsize":4,"unit":"s","convert":"timestamp"},"0":{"name":"event"},"1":{"name":"event_type"},"2":{"name":"data16","base":"uint16","bsize":2,"unit":""},"3":{"name":"data","base":"uint32","bsize":4},"4":{"name":"event_group","base":"uint8","bsize":1},"7":{"name":"score","base":"uint16","bsize":2},"8":{"name":"opponent_score","base":"uint16","bsize":2},"9":{"name":"front_gear_num"},"10":{"name":"front_gear"},"11":{"name":"rear_gear_num"},"12":{"name":"rear_gear"},"13":{"name":"device_index","base":"uint8","bsize":1},"14":{"name":"activity_type"},"15":{"name":"start_timestamp","base":"uint32","bsize":4,"unit":"s","convert":"timestamp"},"21":{"name":"radar_threat_level_max"},"22":{"name":"radar_threat_count","base":"uint8","bsize":1},"23":{"name":"radar_threat_avg_approach_speed","base":"uint8","bsize":1,"unit":"m/s","scale":10},"24":{"name":"radar_threat_max_approach_speed","base":"uint8","bsize":1,"unit":"m/s","scale":10}},"device_info":{"253":{"name":"timestamp","base":"uint32","bsize":4,"unit":"s","convert":"timestamp"},"0":{"name":"device_index","base":"uint8","bsize":1},"1":{"name":"device_type","base":"uint8","bsize":1},"2":{"name":"manufacturer","base":"uint16","bsize":2},"3":{"name":"serial_number","base":"uint32z","bsize":4},"4":{"name":"product","base":"uint16","bsize":2},"5":{"name":"software_version","base":"uint16","bsize":2,"scale":100},"6":{"name":"hardware_version","base":"uint8","bsize":1},"7":{"name":"cum_operating_time","base":"uint32","bsize":4,"unit":"s"},"10":{"name":"battery_voltage","base":"uint16","bsize":2,"unit":"V","scale":256},"11":{"name":"battery_status","base":"uint8","bsize":1},"18":{"name":"sensor_position"},"19":{"name":"descriptor","base":"string","bsize":1},"20":{"name":"ant_transmission_type"},"21":{"name":"ant_device_number","base":"uint16z","bsize":2},"22":{"name":"ant_network"},"25":{"name":"source_type"},"27":{"name":"product_name","base":"string","bsize":1},"32":{"name":"battery_level","base":"uint8","bsize":1,"unit":"%"}},"battery":{"253":{"name":"timestamp","base":"uint32","bsize":4,"convert":"timestamp"},"2":{"name":"capacity","base":"uint8","bsize":1,"unit":"%"}},"gps_metadata":{"253":{"name":"timestamp","base":"uint32","bsize":4,"unit":"s","convert":"timestamp"},"0":{"name":"timestamp_ms","base":"uint16","bsize":2,"unit":"ms"},"1":{"name":"position_lat","base":"sint32","bsize":4,"unit":"semicircles","convert":"semicircles"},"2":{"name":"position_long","base":"sint32","bsize":4,"unit":"semicircles","convert":"semicircles"},"3":{"name":"enhanced_altitude","base":"uint32","bsize":4,"unit":"m","scale":5,"offset":500},"4":{"name":"enhanced_speed","base":"uint32","bsize":4,"unit":"m/s","scale":1000},"5":{"name":"heading","base":"uint16","bsize":2,"unit":"degrees","scale":100},"6":{"name":"utc_timestamp","base":"uint32","bsize":4,"unit":"s","convert":"timestamp"},"7":{"name":"velocity","base":"sint16","bsize":2,"unit":"m/s","scale":100}},"course":{"4":{"name":"sport"},"5":{"name":"name","base":"string","bsize":1},"6":{"name":"capabilities","base":"uint32z","bsize":4},"7":{"name":"sub_sport"}},"course_point":{"254":{"name":"message_index","base":"uint16","bsize":2},"1":{"name":"timestamp","base":"uint32","bsize":4,"convert":"timestamp"},"2":{"name":"position_lat","base":"sint32","bsize":4,"unit":"semicircles","convert":"semicircles"},"3":{"name":"position_long","base":"sint32","bsize":4,"unit":"semicircles","convert":"semicircles"},"4":{"name":"distance","base":"uint32","bsize":4,"unit":"m","scale":100},"5":{"name":"type"},"6":{"name":"name","base":"string","bsize":1},"8":{"name":"favorite"}},"schedule":{"0":{"name":"manufacturer","base":"uint16","bsize":2},"1":{"name":"product","base":"uint16","bsize":2},"2":{"name":"serial_number","base":"uint32z","bsize":4},"3":{"name":"time_created","base":"uint32","bsize":4,"convert":"timestamp"},"4":{"name":"completed"},"5":{"name":"type"},"6":{"name":"scheduled_time","base":"uint32","bsize":4,"convert":"timestamp"}},"totals":{"254":{"name":"message_index","base":"uint16","bsize":2},"253":{"name":"timestamp","base":"uint32","bsize":4,"unit":"s","convert":"timestamp"},"0":{"name":"timer_time","base":"uint32","bsize":4,"unit":"s"},"1":{"name":"distance","base":"uint32","bsize":4,"unit":"m"},"2":{"name":"calories","base":"uint32","bsize":4,"unit":"kcal"},"3":{"name":"sport"},"4":{"name":"elapsed_time","base":"uint32","bsize":4,"unit":"s"},"5":{"name":"sessions","base":"uint16","bsize":2},"6":{"name":"active_time","base":"uint32","bsize":4,"unit":"s"},"9":{"name":"sport_index","base":"uint8","bsize":1}},"weight_scale":{"253":{"name":"timestamp","base":"uint32","bsize":4,"unit":"s","convert":"timestamp"},"0":{"name":"weight","base":"uint16","bsize":2,"unit":"kg","scale":100},"1":{"name":"percent_fat","base":"uint16","bsize":2,"unit":"%","scale":100},"2":{"name":"percent_hydration","base":"uint16","bsize":2,"unit":"%","scale":100},"3":{"name":"visceral_fat_mass","base":"uint16","bsize":2,"unit":"kg","scale":100},"4":{"name":"bone_mass","base":"uint16","bsize":2,"unit":"kg","scale":100},"5":{"name":"muscle_mass","base":"uint16","bsize":2,"unit":"kg","scale":100},"7":{"name":"basal_met","base":"uint16","bsize":2,"unit":"kcal/day","scale":4},"8":{"name":"physique_rating","base":"uint8","bsize":1},"9":{"name":"active_met","base":"uint16","bsize":2,"unit":"kcal/day","scale":4},"10":{"name":"metabolic_age","base":"uint8","bsize":1,"unit":"years"},"11":{"name":"visceral_fat_rating","base":"uint8","bsize":1},"12":{"name":"user_profile_index","base":"uint16","bsize":2},"13":{"name":"bmi","base":"uint16","bsize":2,"unit":"kg/m^2","scale":10}},"blood_pressure":{"253":{"name":"timestamp","base":"uint32","bsize":4,"unit":"s","convert":"timestamp"},"0":{"name":"systolic_pressure","base":"uint16","bsize":2,"unit":"mmHg"},"1":{"name":"diastolic_pressure","base":"uint16","bsize":2,"unit":"mmHg"},"2":{"name":"mean_arterial_pressure","base":"uint16","bsize":2,"unit":"mmHg"},"3":{"name":"map_3_sample_mean","base":"uint16","bsize":2,"unit":"mmHg"},"4":{"name":"map_morning_values","base":"uint16","bsize":2,"unit":"mmHg"},"5":{"name":"map_evening_values","base":"uint16","bsize":2,"unit":"mmHg"},"6":{"name":"heart_rate","base":"uint8","bsize":1,"unit":"bpm"},"7":{"name":"heart_rate_type"},"8":{"name":"status"},"9":{"name":"user_profile_index","base":"uint16","bsize":2}},"monitoring_info":{"253":{"name":"timestamp","base":"uint32","bsize":4,"unit":"s","convert":"timestamp"},"0":{"name":"local_timestamp","base":"uint32","bsize":4,"unit":"s","convert":"timestamp"},"1":{"name":"activity_type"},"3":{"name":"cycles_to_distance","base":"uint16","bsize":2,"unit":"m/cycle","scale":5000},"4":{"name":"cycles_to_calories","base":"uint16","bsize":2,"unit":"kcal/cycle","scale":5000},"5":{"name":"resting_metabolic_rate","base":"uint16","bsize":2,"unit":"kcal / day"}},"monitoring":{"253":{"name":"timestamp","base":"uint32","bsize":4,"unit":"s","convert":"timestamp"},"0":{"name":"device_index","base":"uint8","bsize":1},"1":{"name":"calories","base":"uint16","bsize":2,"unit":"kcal"},"2":{"name":"distance","base":"uint32","bsize":4,"unit":"m","scale":100},"3":{"name":"cycles","base":"uint32","bsize":4,"unit":"cycles","scale":2},"4":{"name":"active_time","base":"uint32","bsize":4,"unit":"s","scale":1000},"5":{"name":"activity_type"},"6":{"name":"activity_subtype"},"7":{"name":"activity_level"},"8":{"name":"distance_16","base":"uint16","bsize":2,"unit":"100 * m"},"9":{"name":"cycles_16","base":"uint16","bsize":2,"unit":"2 * cycles (steps)"},"10":{"name":"active_time_16","base":"uint16","bsize":2,"unit":"s"},"11":{"name":"local_timestamp","base":"uint32","bsize":4,"convert":"timestamp"},"12":{"name":"temperature","base":"sint16","bsize":2,"unit":"C","scale":100},"14":{"name":"temperature_min","base":"sint16","bsize":2,"unit":"C","scale":100},"15":{"name":"temperature_max","base":"sint16","bsize":2,"unit":"C","scale":100},"16":{"name":"activity_time","base":"uint16","bsize":2,"unit":"minutes"},"19":{"name":"active_calories","base":"uint16","bsize":2,"unit":"kcal"},"24":{"name":"current_activity_type_intensity","base":"byte","bsize":1,"unit":""},"25":{"name":"timestamp_min_8","base":"uint8","bsize":1,"unit":"min"},"26":{"name":"timestamp_16","base":"uint16","bsize":2,"unit":"s"},"27":{"name":"heart_rate","base":"uint8","bsize":1,"unit":"bpm"},"28":{"name":"intensity","base":"uint8","bsize":1,"scale":10},"29":{"name":"duration_min","base":"uint16","bsize":2,"unit":"min"},"30":{"name":"duration","base":"uint32","bsize":4,"unit":"s"},"31":{"name":"ascent","base":"uint32","bsize":4,"unit":"m","scale":1000},"32":{"name":"descent","base":"uint32","bsize":4,"unit":"m","scale":1000},"33":{"name":"moderate_activity_minutes","base":"uint16","bsize":2,"unit":"minutes"},"34":{"name":"vigorous_activity_minutes","base":"uint16","bsize":2,"unit":"minutes"},"41":{"name":"pushes","base":"uint32","bsize":4}},"monitoring_hr_data":{"253":{"name":"timestamp","base":"uint32","bsize":4,"unit":"s","convert":"timestamp"},"0":{"name":"resting_heart_rate","base":"uint8","bsize":1,"unit":"bpm"},"1":{"name":"current_day_resting_heart_rate","base":"uint8","bsize":1,"unit":"bpm"}},"hr":{"253":{"name":"timestamp","base":"uint32","bsize":4,"convert":"timestamp"},"0":{"name":"fractional_timestamp","base":"uint16","bsize":2,"unit":"s","scale":32768},"1":{"name":"time256","base":"uint8","bsize":1,"unit":"s","scale":256},"6":{"name":"filtered_bpm","base":"uint8","bsize":1,"unit":"bpm"},"9":{"name":"event_timestamp","base":"uint32","bsize":4,"unit":"s","scale":1024},"10":{"name":"event_timestamp_12","base":"byte","bsize":1,"unit":"s","scale":1024}},"stress_level":{"0":{"name":"stress_level_value","base":"sint16","bsize":2},"1":{"name":"stress_level_time","base":"uint32","bsize":4,"unit":"s","convert":"timestamp"}},"sleep_level":{"253":{"name":"timestamp","base":"uint32","bsize":4,"unit":"s","convert":"timestamp"},"0":{"name":"sleep_level"}},"hrv":{"0":{"name":"time","base":"uint16","bsize":2,"unit":"s","scale":1000}},"hrv_status_summary":{"253":{"name":"timestamp","base":"uint32","bsize":4,"convert":"timestamp"},"0":{"name":"weekly_average","base":"uint16","bsize":2,"unit":"ms","scale":128},"1":{"name":"last_night_average","base":"uint16","bsize":2,"unit":"ms","scale":128},"2":{"name":"last_night_5_min_high","base":"uint16","bsize":2,"unit":"ms","scale":128},"3":{"name":"baseline_low_upper","base":"uint16","bsize":2,"unit":"ms","scale":128},"4":{"name":"baseline_balanced_lower","base":"uint16","bsize":2,"unit":"ms","scale":128},"5":{"name":"baseline_balanced_upper","base":"uint16","bsize":2,"unit":"ms","scale":128},"6":{"name":"status"}},"hrv_value":{"253":{"name":"timestamp","base":"uint32","bsize":4,"convert":"timestamp"},"0":{"name":"value","base":"uint16","bsize":2,"unit":"ms","scale":128}},"respiration_rate":{"253":{"name":"timestamp","base":"uint32","bsize":4,"convert":"timestamp"},"0":{"name":"respiration_rate","base":"sint16","bsize":2,"unit":"breaths/min","scale":100}},"sleep_assessment":{"0":{"name":"combined_awake_score","base":"uint8","bsize":1},"1":{"name":"awake_time_score","base":"uint8","bsize":1},"2":{"name":"awakenings_count_score","base":"uint8","bsize":1},"3":{"name":"deep_sleep_score","base":"uint8","bsize":1},"4":{"name":"sleep_duration_score","base":"uint8","bsize":1},"5":{"name":"light_sleep_score","base":"uint8","bsize":1},"6":{"name":"overall_sleep_score","base":"uint8","bsize":1},"7":{"name":"sleep_quality_score","base":"uint8","bsize":1},"8":{"name":"sleep_recovery_score","base":"uint8","bsize":1},"9":{"name":"rem_sleep_score","base":"uint8","bsize":1},"10":{"name":"sleep_restlessness_score","base":"uint8","bsize":1},"11":{"name":"awakenings_count","base":"uint8","bsize":1},"14":{"name":"interruptions_score","base":"uint8","bsize":1},"15":{"name":"average_stress_during_sleep","base":"uint16","bsize":2,"scale":100}}},"ENUMS":{"sport":{"0":"generic","1":"running","2":"cycling","3":"transition","4":"fitness_equipment","5":"swimming","6":"basketball","7":"soccer","8":"tennis","9":"american_football","10":"training","11":"walking","12":"cross_country_skiing","13":"alpine_skiing","14":"snowboarding","15":"rowing","16":"mountaineering","17":"hiking","18":"multisport","19":"paddling","20":"flying","21":"e_biking","22":"motorcycling","23":"boating","24":"driving","25":"golf","26":"hang_gliding","27":"horseback_riding","28":"hunting","29":"fishing","30":"inline_skating","31":"rock_climbing","32":"sailing","33":"ice_skating","34":"sky_diving","35":"snowshoeing","36":"snowmobiling","37":"stand_up_paddleboarding","38":"surfing","39":"wakeboarding","40":"water_skiing","41":"kayaking","42":"rafting","43":"windsurfing","44":"kitesurfing","45":"tactical","46":"jumpmaster","47":"boxing","48":"floor_climbing","49":"baseball","53":"diving","56":"shooting","58":"winter_sport","59":"grinding","62":"hiit","63":"video_gaming","64":"racket","65":"wheelchair_push_walk","66":"wheelchair_push_run","67":"meditation","68":"para_sport","69":"disc_golf","70":"team_sport","71":"cricket","72":"rugby","73":"hockey","74":"lacrosse","75":"volleyball","76":"water_tubing","77":"wakesurfing","78":"water_sport","79":"archery","80":"mixed_martial_arts","81":"motor_sports","82":"snorkeling","83":"dance","84":"jump_rope","85":"pool_apnea","86":"mobility","87":"geocaching","88":"canoeing","254":"all"},"sub_sport":{"0":"generic","1":"treadmill","2":"street","3":"trail","4":"track","5":"spin","6":"indoor_cycling","7":"road","8":"mountain","9":"downhill","10":"recumbent","11":"cyclocross","12":"hand_cycling","13":"track_cycling","14":"indoor_rowing","15":"elliptical","16":"stair_climbing","17":"lap_swimming","18":"open_water","19":"flexibility_training","20":"strength_training","21":"warm_up","22":"match","23":"exercise","24":"challenge","25":"indoor_skiing","26":"cardio_training","27":"indoor_walking","28":"e_bike_fitness","29":"bmx","30":"casual_walking","31":"speed_walking","32":"bike_to_run_transition","33":"run_to_bike_transition","34":"swim_to_bike_transition","35":"atv","36":"motocross","37":"backcountry","38":"resort","39":"rc_drone","40":"wingsuit","41":"whitewater","42":"skate_skiing","43":"yoga","44":"pilates","45":"indoor_running","46":"gravel_cycling","47":"e_bike_mountain","48":"commuting","49":"mixed_surface","50":"navigate","51":"track_me","52":"map","53":"single_gas_diving","54":"multi_gas_diving","55":"gauge_diving","56":"apnea_diving","57":"apnea_hunting","58":"virtual_activity","59":"obstacle","62":"breathing","63":"ccr_diving","65":"sail_race","66":"expedition","67":"ultra","68":"indoor_climbing","69":"bouldering","70":"hiit","71":"indoor_grinding","72":"hunting_with_dogs","73":"amrap","74":"emom","75":"tabata","77":"esport","78":"triathlon","79":"duathlon","80":"brick","81":"swim_run","82":"adventure_race","83":"trucker_workout","84":"pickleball","85":"padel","86":"indoor_wheelchair_walk","87":"indoor_wheelchair_run","88":"indoor_hand_cycling","90":"field","91":"ice","92":"ultimate","93":"platform","94":"squash","95":"badminton","96":"racquetball","97":"table_tennis","98":"overland","99":"trolling_motor","110":"fly_canopy","111":"fly_paraglide","112":"fly_paramotor","113":"fly_pressurized","114":"fly_navigate","115":"fly_timer","116":"fly_altimeter","117":"fly_wx","118":"fly_vfr","119":"fly_ifr","121":"dynamic_apnea","123":"enduro","124":"rucking","125":"rally","126":"pool_triathlon","127":"e_bike_enduro","254":"all"},"file":{"1":"device","2":"settings","3":"sport","4":"activity","5":"workout","6":"course","7":"schedules","9":"weight","10":"totals","11":"goals","14":"blood_pressure","15":"monitoring_a","20":"activity_summary","28":"monitoring_daily","32":"monitoring_b","34":"segment","35":"segment_list","40":"exd_configuration","247":"mfg_range_min","254":"mfg_range_max"},"event":{"0":"timer","3":"workout","4":"workout_step","5":"power_down","6":"power_up","7":"off_course","8":"session","9":"lap","10":"course_point","11":"battery","12":"virtual_partner_pace","13":"hr_high_alert","14":"hr_low_alert","15":"speed_high_alert","16":"speed_low_alert","17":"cad_high_alert","18":"cad_low_alert","19":"power_high_alert","20":"power_low_alert","21":"recovery_hr","22":"battery_low","23":"time_duration_alert","24":"distance_duration_alert","25":"calorie_duration_alert","26":"activity","27":"fitness_equipment","28":"length","32":"user_marker","33":"sport_point","36":"calibration","42":"front_gear_change","43":"rear_gear_change","44":"rider_position_change","45":"elev_high_alert","46":"elev_low_alert","47":"comm_timeout","54":"auto_activity_detect","56":"dive_alert","57":"dive_gas_switched","71":"tank_pressure_reserve","72":"tank_pressure_critical","73":"tank_lost","75":"radar_threat_alert","76":"tank_battery_low","81":"tank_pod_connected","82":"tank_pod_disconnected"},"event_type":{"0":"start","1":"stop","2":"consecutive_depreciated","3":"marker","4":"stop_all","5":"begin_depreciated","6":"end_depreciated","7":"end_all_depreciated","8":"stop_disable","9":"stop_disable_all"},"manufacturer":{"1":"garmin","2":"garmin_fr405_antfs","3":"zephyr","4":"dayton","5":"idt","6":"srm","7":"quarq","8":"ibike","9":"saris","10":"spark_hk","11":"tanita","12":"echowell","13":"dynastream_oem","14":"nautilus","15":"dynastream","16":"timex","17":"metrigear","18":"xelic","19":"beurer","20":"cardiosport","21":"a_and_d","22":"hmm","23":"suunto","24":"thita_elektronik","25":"gpulse","26":"clean_mobile","27":"pedal_brain","28":"peaksware","29":"saxonar","30":"lemond_fitness","31":"dexcom","32":"wahoo_fitness","33":"octane_fitness","34":"archinoetics","35":"the_hurt_box","36":"citizen_systems","37":"magellan","38":"osynce","39":"holux","40":"concept2","41":"shimano","42":"one_giant_leap","43":"ace_sensor","44":"brim_brothers","45":"xplova","46":"perception_digital","47":"bf1systems","48":"pioneer","49":"spantec","50":"metalogics","51":"4iiiis","52":"seiko_epson","53":"seiko_epson_oem","54":"ifor_powell","55":"maxwell_guider","56":"star_trac","57":"breakaway","58":"alatech_technology_ltd","59":"mio_technology_europe","60":"rotor","61":"geonaute","62":"id_bike","63":"specialized","64":"wtek","65":"physical_enterprises","66":"north_pole_engineering","67":"bkool","68":"cateye","69":"stages_cycling","70":"sigmasport","71":"tomtom","72":"peripedal","73":"wattbike","76":"moxy","77":"ciclosport","78":"powerbahn","79":"acorn_projects_aps","80":"lifebeam","81":"bontrager","82":"wellgo","83":"scosche","84":"magura","85":"woodway","86":"elite","87":"nielsen_kellerman","88":"dk_city","89":"tacx","90":"direction_technology","91":"magtonic","92":"1partcarbon","93":"inside_ride_technologies","94":"sound_of_motion","95":"stryd","96":"icg","97":"MiPulse","98":"bsx_athletics","99":"look","100":"campagnolo_srl","101":"body_bike_smart","102":"praxisworks","103":"limits_technology","104":"topaction_technology","105":"cosinuss","106":"fitcare","107":"magene","108":"giant_manufacturing_co","109":"tigrasport","110":"salutron","111":"technogym","112":"bryton_sensors","113":"latitude_limited","114":"soaring_technology","115":"igpsport","116":"thinkrider","117":"gopher_sport","118":"waterrower","119":"orangetheory","120":"inpeak","121":"kinetic","122":"johnson_health_tech","123":"polar_electro","124":"seesense","125":"nci_technology","126":"iqsquare","127":"leomo","128":"ifit_com","129":"coros_byte","130":"versa_design","131":"chileaf","132":"cycplus","133":"gravaa_byte","134":"sigeyi","135":"coospo","136":"geoid","137":"bosch","138":"kyto","139":"kinetic_sports","140":"decathlon_byte","141":"tq_systems","142":"tag_heuer","143":"keiser_fitness","144":"zwift_byte","145":"porsche_ep","146":"blackbird","147":"meilan_byte","148":"ezon","149":"laisi","150":"myzone","151":"abawo","152":"bafang","153":"luhong_technology","255":"development","257":"healthandlife","258":"lezyne","259":"scribe_labs","260":"zwift","261":"watteam","262":"recon","263":"favero_electronics","264":"dynovelo","265":"strava","266":"precor","267":"bryton","268":"sram","269":"navman","270":"cobi","271":"spivi","272":"mio_magellan","273":"evesports","274":"sensitivus_gauge","275":"podoon","276":"life_time_fitness","277":"falco_e_motors","278":"minoura","279":"cycliq","280":"luxottica","281":"trainer_road","282":"the_sufferfest","283":"fullspeedahead","284":"virtualtraining","285":"feedbacksports","286":"omata","287":"vdo","288":"magneticdays","289":"hammerhead","290":"kinetic_by_kurt","291":"shapelog","292":"dabuziduo","293":"jetblack","294":"coros","295":"virtugo","296":"velosense","297":"cycligentinc","298":"trailforks","299":"mahle_ebikemotion","300":"nurvv","301":"microprogram","302":"zone5cloud","303":"greenteg","304":"yamaha_motors","305":"whoop","306":"gravaa","307":"onelap","308":"monark_exercise","309":"form","310":"decathlon","311":"syncros","312":"heatup","313":"cannondale","314":"true_fitness","315":"RGT_cycling","316":"vasa","317":"race_republic","318":"fazua","319":"oreka_training","320":"lsec","321":"lululemon_studio","322":"shanyue","323":"spinning_mda","324":"hilldating","325":"aero_sensor","326":"nike","327":"magicshine","328":"ictrainer","329":"absolute_cycling","330":"eo_swimbetter","331":"mywhoosh","332":"ravemen","333":"tektro_racing_products","334":"darad_innovation_corporation","335":"cycloptim","337":"runna","339":"zepp","340":"peloton","341":"carv","342":"tissot","345":"real_velo","346":"wetech","347":"jespr","348":"huawei","349":"gotoes","350":"cadence_app","351":"una_watch","352":"tymewear","353":"exposure_lights","354":"forto_cycling","5759":"actigraphcorp"},"activity":{"0":"manual","1":"auto_multi_sport"},"session_trigger":{"0":"activity_end","1":"manual","2":"auto_multi_sport","3":"fitness_equipment"},"lap_trigger":{"0":"manual","1":"time","2":"distance","3":"position_start","4":"position_lap","5":"position_waypoint","6":"position_marked","7":"session_end","8":"fitness_equipment"},"gender":{"0":"female","1":"male"},"sleep_level":{"0":"unmeasurable","1":"awake","2":"light","3":"deep","4":"rem"}}};
+/* ============================================================================
+   COUCHE 1 — FitParser : binaire FIT -> objets JS
+   Spécification : header (12 ou 14 octets, signature ".FIT"), puis messages.
+   - header normal (bit 7 = 0) : bit 6 = définition, bit 5 = champs développeur,
+     bits 3-0 = n° local.
+   - compressed timestamp header (bit 7 = 1) : bits 6-5 = n° local (0-3),
+     bits 4-0 = décalage de temps (5 bits, secondes) relatif au dernier
+     timestamp lu : ts = (dernier & ~31) + offset (+32 si offset < dernier&31).
+   - message de définition : reserved(1) + architecture(1, 0=LE 1=BE) +
+     n° global(2) + nb champs(1) + champs(num,size,type) [+ nb dev + dev fields].
+   CRC-16 (poly 0x1021, init 0, MSB first) sur header+data, stocké en fin.
+   ========================================================================== */
+
+const FIT_EPOCH_MS = Date.UTC(1989, 11, 31, 0, 0, 0); // 1989-12-31T00:00:00Z
+
+const BASE_TYPES = {
+  0x00:{name:'uint8',  size:1, invalid:0xFF},
+  0x01:{name:'sint8',  size:1, invalid:0x7F},
+  0x02:{name:'uint16', size:2, invalid:0xFFFF},
+  0x83:{name:'sint16', size:2, invalid:0x7FFF},
+  0x84:{name:'uint32', size:4, invalid:0xFFFFFFFF},
+  0x85:{name:'sint32', size:4, invalid:0x7FFFFFFF},
+  0x86:{name:'string', size:1, invalid:-1},
+  0x87:{name:'float32',size:4, invalid:0xFFFFFFFF},
+  0x88:{name:'float64',size:8, invalid:-1},
+  0x89:{name:'byte',   size:1, invalid:-1},
+  0x8A:{name:'uint16z',size:2, invalid:0},
+  0x8B:{name:'uint32z',size:4, invalid:0},
+  0x8C:{name:'sint8z', size:1, invalid:0x80},
+  0x8D:{name:'sint16z',size:2, invalid:0x8000},
+  0x8E:{name:'sint32z',size:4, invalid:0x80000000},
+};
+
+/* Tables générées depuis le profil officiel Garmin (SDK) : FIT_PROFILE =
+   { GLOBAL_MESSAGES:{num->nom}, FIELD_DEFS:{nom->{champ->{name,unit,scale,
+   offset,convert}}}, ENUMS:{sport,file,event,...:{valeur->nom}} } */
+const GLOBAL_MESSAGES = FIT_PROFILE.GLOBAL_MESSAGES;
+const FIELD_DEFS = FIT_PROFILE.FIELD_DEFS;
+const ENUMS = FIT_PROFILE.ENUMS;
+
+/* Base types indexés par NOM (pour la coercion string/byte -> profil numérique). */
+const BASE_TYPES_BY_NAME = {
+  uint8:{invalid:0xFF}, sint8:{invalid:0x7F}, uint16:{invalid:0xFFFF}, sint16:{invalid:0x7FFF},
+  uint32:{invalid:0xFFFFFFFF}, sint32:{invalid:0x7FFFFFFF}, float32:{invalid:0xFFFFFFFF},
+  uint16z:{invalid:0}, uint32z:{invalid:0}, sint8z:{invalid:0x80}, sint16z:{invalid:0x8000}, sint32z:{invalid:0x80000000},
+};
+
+const CRC_TABLE = (() => {
+  const t = new Uint16Array(256);
+  for (let i = 0; i < 256; i++) {
+    let c = i << 8;
+    for (let j = 0; j < 8; j++) c = (c & 0x8000) ? ((c << 1) ^ 0x1021) : (c << 1);
+    t[i] = c & 0xFFFF;
+  }
+  return t;
+})();
+
+function fitCrc16(bytes, start, end) {
+  let crc = 0;
+  for (let i = start; i < end; i++)
+    crc = ((crc << 8) & 0xFFFF) ^ CRC_TABLE[((crc >> 8) ^ bytes[i]) & 0xFF];
+  return crc & 0xFFFF;
+}
+
+/* Compressed timestamp : reconstruction du timestamp (secondes FIT). */
+function applyCompressedOffset(offset, lastTs) {
+  let ts = (lastTs & ~31) + offset;
+  if (offset < (lastTs & 31)) ts += 32;
+  return ts >>> 0;
+}
+
+class FitParser {
+  /* Retourne { header, messages:[{type,name,fields,raw}], warnings } ou lève
+     une Error avec message clair si le fichier n'est pas un .fit valide. */
+  parse(arrayBuffer) {
+    const bytes = new Uint8Array(arrayBuffer);
+    const dv = new DataView(arrayBuffer);
+    if (bytes.length < 12) throw new Error('Fichier trop petit (< 12 octets) : ce n\'est pas un .fit valide.');
+    const hdrSize = dv.getUint8(0);
+    if (hdrSize !== 12 && hdrSize !== 14) throw new Error('Taille d\'en-tête invalide (' + hdrSize + ') : fichier corrompu ou non standard.');
+    const protocol = dv.getUint8(1);
+    const profile = dv.getUint16(2, true);
+    const dataSize = dv.getUint32(4, true);
+    const magic = String.fromCharCode(bytes[8], bytes[9], bytes[10], bytes[11]);
+    if (magic !== '.FIT') throw new Error('Signature ".FIT" absente : ce n\'est pas un fichier FIT.');
+    if (hdrSize + dataSize + 2 > bytes.length)
+      throw new Error('Taille déclarée (' + dataSize + ' octets) supérieure au contenu du fichier : fichier tronqué.');
+
+    const warnings = [];
+    if (hdrSize === 14) {
+      const hdrCrcStored = dv.getUint16(12, true);
+      if (hdrCrcStored !== fitCrc16(bytes, 0, 12))
+        warnings.push('CRC de l\'en-tête invalide (fichier non conforme ou modifié) — décodage poursuivi.');
+    }
+    const fileCrcStored = dv.getUint16(hdrSize + dataSize, true);
+    const fileCrcCalc = fitCrc16(bytes, 0, hdrSize + dataSize);
+    if (fileCrcStored !== fileCrcCalc)
+      warnings.push('CRC du fichier invalide (fichier non conforme ou modifié) — décodage poursuivi malgré tout.');
+
+    const header = { size: hdrSize, protocol, profile, dataSize, crcOk: fileCrcStored === fileCrcCalc };
+    const messages = [];
+    const defs = new Map();
+    let pos = hdrSize;
+    const end = hdrSize + dataSize;
+    let lastTs = 0; // accumulateur compressed timestamp (secondes FIT)
+
+    while (pos < end) {
+      const h = dv.getUint8(pos);
+      if (h & 0x80) {
+        // compressed timestamp header
+        const local = (h >> 5) & 0x3;
+        const timeOffset = h & 0x1F;
+        const def = defs.get(local);
+        if (!def) throw new Error('Message compressé sans définition préalable (n° local ' + local + ', offset ' + pos + ') : fichier corrompu.');
+        if (pos + 1 + def.dataLen > end) throw new Error('Message tronqué à l\'offset ' + pos + ' : fichier corrompu.');
+        const name = GLOBAL_MESSAGES[def.gmn] || ('message_' + def.gmn);
+        const { fields, raw } = this._decodeFields(dv, pos + 1, def);
+        // met à jour l'accumulateur si le message porte un timestamp brut
+        const t253 = raw['f253'];
+        if (typeof t253 === 'number') lastTs = t253 >>> 0;
+        const ts = applyCompressedOffset(timeOffset, lastTs);
+        lastTs = ts;
+        if (raw['f253'] === undefined || raw['f253'] === null) {
+          raw['f253'] = ts;
+          fields.timestamp = new Date(FIT_EPOCH_MS + ts * 1000).toISOString();
+        }
+        messages.push({ type: def.gmn, name, fields, raw, offset: pos, tsRef: lastTs });
+        pos += 1 + def.dataLen;
+      } else if (h & 0x40) {
+        // message de définition
+        const local = h & 0x0F;
+        if (pos + 6 > end) throw new Error('Message de définition tronqué à l\'offset ' + pos + '.');
+        const arch = dv.getUint8(pos + 2);
+        const gmn = dv.getUint16(pos + 3, arch === 0);
+        const numFields = dv.getUint8(pos + 5);
+        let p = pos + 6;
+        if (p + numFields * 3 > end) throw new Error('Message de définition tronqué à l\'offset ' + pos + '.');
+        const fields = [];
+        for (let i = 0; i < numFields; i++) {
+          fields.push({ num: dv.getUint8(p), size: dv.getUint8(p + 1), type: dv.getUint8(p + 2) });
+          p += 3;
+        }
+        if (h & 0x20) { // champs développeur
+          if (p >= end) throw new Error('Définition développeur tronquée à l\'offset ' + pos + '.');
+          const numDev = dv.getUint8(p); p++;
+          if (p + numDev * 3 > end) throw new Error('Définition développeur tronquée à l\'offset ' + pos + '.');
+          for (let i = 0; i < numDev; i++) {
+            fields.push({ num: dv.getUint8(p), size: dv.getUint8(p + 1), type: dv.getUint8(p + 2), dev: true });
+            p += 3;
+          }
+        }
+        let dataLen = 0;
+        for (const f of fields) dataLen += f.size;
+        defs.set(local, { gmn, arch, fields, dataLen });
+        pos = p;
+      } else {
+        // message de données
+        const local = h & 0x0F;
+        const def = defs.get(local);
+        if (!def) throw new Error('Message de données sans définition préalable (n° local ' + local + ', offset ' + pos + ') : fichier corrompu.');
+        if (pos + 1 + def.dataLen > end) throw new Error('Message de données tronqué à l\'offset ' + pos + '.');
+        const name = GLOBAL_MESSAGES[def.gmn] || ('message_' + def.gmn);
+        const { fields, raw } = this._decodeFields(dv, pos + 1, def);
+        const t253 = raw['f253'];
+        if (typeof t253 === 'number') lastTs = t253 >>> 0;
+        messages.push({ type: def.gmn, name, fields, raw, offset: pos, tsRef: lastTs });
+        pos += 1 + def.dataLen;
+      }
+    }
+    return { header, messages, warnings };
+  }
+
+  _readScalar(dv, q, type, le, byteLen) {
+    let v;
+    switch (type) {
+      case 0x00: case 0x89: v = dv.getUint8(q); break;
+      case 0x01: case 0x8C: v = dv.getInt8(q); break;
+      case 0x02: case 0x8A: v = byteLen === 1 ? dv.getUint8(q) : dv.getUint16(q, le); break;
+      case 0x83: case 0x8D: v = byteLen === 1 ? dv.getInt8(q) : dv.getInt16(q, le); break;
+      case 0x84: case 0x8B: v = byteLen === 1 ? dv.getUint8(q) : byteLen === 2 ? dv.getUint16(q, le) : dv.getUint32(q, le); break;
+      case 0x85: case 0x8E: v = byteLen === 1 ? dv.getInt8(q) : byteLen === 2 ? dv.getInt16(q, le) : dv.getInt32(q, le); break;
+      case 0x87: v = dv.getFloat32(q, le); break;
+      case 0x88: v = dv.getFloat64(q, le); break;
+      default: return null;
+    }
+    const bt = BASE_TYPES[type];
+    if (bt && bt.invalid !== -1 && v === bt.invalid) return null;
+    return v;
+  }
+
+  /* Lecture d'un scalaire selon le base type NOMMÉ DU PROFIL (coercion). */
+  _readByProfileBase(dv, q, base, le) {
+    switch (base) {
+      case 'uint8': return dv.getUint8(q);
+      case 'sint8': case 'sint8z': return dv.getInt8(q);
+      case 'uint16': case 'uint16z': return dv.getUint16(q, le);
+      case 'sint16': case 'sint16z': return dv.getInt16(q, le);
+      case 'uint32': case 'uint32z': return dv.getUint32(q, le);
+      case 'sint32': case 'sint32z': return dv.getInt32(q, le);
+      case 'float32': return dv.getFloat32(q, le);
+      case 'float64': return dv.getFloat64(q, le);
+      default: return null;
+    }
+  }
+  _decodeFields(dv, start, def) {
+    const le = def.arch === 0;
+    const fieldDefs = FIELD_DEFS[GLOBAL_MESSAGES[def.gmn] || ''] || {};
+    const fields = {};
+    const raw = {};
+    let p = start;
+    for (const f of def.fields) {
+      const bt = BASE_TYPES[f.type];
+      const fdPre = fieldDefs[f.num];
+      if (!bt) { raw['f' + f.num] = '<type inconnu 0x' + f.type.toString(16) + '>'; p += f.size; continue; }
+      /* Fichiers non standard : champ déclaré string/byte (0x86/0x89) alors que
+         le profil Garmin attend un nombre/date -> on relit les octets comme un
+         entier/float du base type du profil (endian selon arch). */
+      if (fdPre && fdPre.base && fdPre.bsize && fdPre.base !== 'string' && fdPre.base !== 'byte' &&
+          (f.type === 0x86 || f.type === 0x89)) {
+        const count = Math.max(1, Math.floor(f.size / fdPre.bsize));
+        const vals = [];
+        for (let i = 0; i < count; i++) {
+          const v = this._readByProfileBase(dv, p + i * fdPre.bsize, fdPre.base, le);
+          const inv = BASE_TYPES_BY_NAME[fdPre.base] ? BASE_TYPES_BY_NAME[fdPre.base].invalid : undefined;
+          vals.push(inv !== undefined && inv !== -1 && v === inv ? null : v);
+        }
+        const val = count === 1 ? vals[0] : vals;
+        raw['f' + f.num] = val;
+        let out = val;
+        if (val !== null && !Array.isArray(val)) {
+          if (fdPre.convert === 'timestamp' && typeof val === 'number')
+            out = new Date(FIT_EPOCH_MS + (val >>> 0) * 1000).toISOString();
+          else if (fdPre.convert === 'semicircles' && typeof val === 'number')
+            out = val * (180 / 2147483648);
+          else if (fdPre.scale)
+            out = val / fdPre.scale + (fdPre.offset || 0);
+        }
+        fields[fdPre.name] = out;
+        p += f.size;
+        continue;
+      }
+      if (f.type === 0x86) { // string (tableau d'octets, terminé par 0)
+        let s = '';
+        for (let i = 0; i < f.size; i++) { const c = dv.getUint8(p + i); if (c === 0) break; s += String.fromCharCode(c); }
+        raw['f' + f.num] = s;
+        const fd0 = fieldDefs[f.num];
+        if (fd0) fields[fd0.name] = s;
+        p += f.size;
+        continue;
+      }
+      if (f.type === 0x89) { // byte array
+        const arr = [];
+        for (let i = 0; i < f.size; i++) arr.push(dv.getUint8(p + i));
+        raw['f' + f.num] = arr;
+        p += f.size;
+        continue;
+      }
+      const count = Math.floor(f.size / bt.size);
+      const vals = [];
+      for (let i = 0; i < count; i++) vals.push(this._readScalar(dv, p + i * bt.size, f.type, le, bt.size));
+      if (count === 0) vals.push(this._readScalar(dv, p, f.type, le, f.size)); // champ plus petit que son type
+      let val = count <= 1 ? vals[0] : vals;
+      const fd = fieldDefs[f.num];
+      // valeur "invalide" selon le type attendu par le profil (ex. 0xFFFF pour un uint16)
+      if (fd && fd.base && BASE_TYPES_BY_NAME[fd.base] && typeof val === 'number') {
+        const inv = BASE_TYPES_BY_NAME[fd.base].invalid;
+        if (inv !== undefined && inv !== -1 && val === inv) val = null;
+      }
+      raw['f' + f.num] = val;
+      if (fd) {
+        let out = val;
+        if (val !== null && !Array.isArray(val)) {
+          if (fd.convert === 'timestamp' && typeof val === 'number')
+            out = new Date(FIT_EPOCH_MS + (val >>> 0) * 1000).toISOString();
+          else if (fd.convert === 'semicircles' && typeof val === 'number')
+            out = val * (180 / 2147483648);
+          else if (fd.scale)
+            out = val / fd.scale + (fd.offset || 0);
+        }
+        fields[fd.name] = out;
+      }
+      p += f.size;
+    }
+    return { fields, raw };
+  }
+}
+
+/* Timestamp FIT (champ brut 253, éventuellement relu depuis une "string") -> ms.
+   Sans champ 253 valide, retombe sur le dernier timestamp connu du fichier
+   (tsRef renseigné par le parseur) : c'est le comportement "best effort" des
+   messages Garmin sans timestamp propre (ex. monitoring heart_rate). */
+function fitTimestampMs(m) {
+  let v = m.raw['f253'];
+  if (typeof v === 'string' && v.length >= 4) {
+    let n = 0;
+    for (let i = 0; i < 4; i++) n += (v.charCodeAt(i) & 0xFF) * 2 ** (8 * i);
+    v = n >>> 0;
+  }
+  if (typeof v === 'number') return FIT_EPOCH_MS + v * 1000;
+  if (m.fields.timestamp) { const t = Date.parse(m.fields.timestamp); if (!Number.isNaN(t)) return t; }
+  if (typeof m.tsRef === 'number') return FIT_EPOCH_MS + m.tsRef * 1000;
+  return null;
+}
+
+/* ============================================================================
+   COUCHE 2 — DataStore : agrège tous les fichiers importés en un jeu de
+   données chronologique unique.
+   Dédoublonnage :
+   - fichiers : ignorés si un fichier de même nom ET même taille est déjà
+     importé avec succès (évite les doubles imports / re-synchro) ;
+   - records (20) : indexés par timestamp ms, fusionnés champ par champ ;
+   - monitoring (55) : dédoublonnés par empreinte t + valeurs ;
+   - sessions (18) : dédoublonnées par (start, sport, distance).
+   ========================================================================== */
+function mergeInto(target, src) {
+  for (const k in src) if (target[k] === null || target[k] === undefined) target[k] = src[k];
+  return target;
+}
+function localDayKey(t) {
+  const d = new Date(t);
+  return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+}
+function dayStartMs(dayKey) {
+  const parts = dayKey.split('-').map(Number);
+  return new Date(parts[0], parts[1] - 1, parts[2]).getTime();
+}
+
+class DataStore {
+  constructor() {
+    this.files = [];            // {id, name, size, parsed, error, doublon}
+    this.records = new Map();   // t(ms) -> point aplati (record à la seconde)
+    this.sessions = [];         // sessions aplaties (18)
+    this.laps = [];             // laps (19)
+    this.monitoring = [];       // points monitoring (55) triés par t
+    this._monKeys = new Set();
+    this.stress = [];           // {t, value} (stress_level 227)
+    this._stressKeys = new Set();
+    this.sleepLevels = [];      // {t, level} (sleep_level 275)
+    this.hrPoints = [];         // {t, bpm} (hr 132 filtered_bpm)
+    this.restingHr = [];        // {t, resting, current_day_resting} (monitoring_hr_data 211)
+    this.gps = [];              // {t, lat, long, alt, speed} (record/gps_metadata positions)
+    this.hrZones = [];          // {index, high, name} depuis hr_zone (8)
+    this.userProfile = {};      // user_profile (3) : age, resting_heart_rate, default_max_heart_rate...
+    this.maxHr = null;          // zones_target (7) max_heart_rate
+    this.other = {};            // autres messages par nom (debug)
+    this._sessionKeys = new Set();
+    this._fileKeys = new Set();
+    this._sortedCache = null;
+    this._monSorted = false;
+  }
+
+  /* Retourne l'entrée créée ; doublon=true si ignoré (même nom+taille déjà OK). */
+  addFile(name, size, parsed, error) {
+    const key = name + '|' + size;
+    const entry = { name, size, parsed, error, id: this.files.length, doublon: false };
+    this.files.push(entry);
+    if (error || !parsed) return entry;
+    if (this._fileKeys.has(key)) { entry.doublon = true; return entry; }
+    this._fileKeys.add(key);
+    this._ingest(parsed);
+    this._sortedCache = null;
+    this._monSorted = false;
+    return entry;
+  }
+
+  _ingest(parsed) {
+    for (const m of parsed.messages) {
+      const t = fitTimestampMs(m);
+      switch (m.name) {
+        case 'record': {
+          if (t === null) break;
+          const p = Object.assign({}, m.fields);
+          delete p.timestamp;
+          p.t = t;
+          if (typeof p.position_lat === 'number' && typeof p.position_long === 'number')
+            this.gps.push({ t, lat: p.position_lat, long: p.position_long, alt: p.altitude ?? p.enhanced_altitude ?? null, speed: p.speed ?? p.enhanced_speed ?? null });
+          const ex = this.records.get(t);
+          this.records.set(t, ex ? mergeInto(ex, p) : p);
+          break;
+        }
+        case 'session': {
+          const start = m.fields.start_time ? Date.parse(m.fields.start_time) : t;
+          const key = (start ?? 'x') + '|' + (m.fields.sport ?? '?') + '|' + (m.fields.total_distance ?? '?');
+          if (this._sessionKeys.has(key)) break;
+          this._sessionKeys.add(key);
+          const s = Object.assign({}, m.fields);
+          if (start !== null && !Number.isNaN(start)) s.startMs = start;
+          if (t !== null) s.t = t;
+          this.sessions.push(s);
+          break;
+        }
+        case 'lap':
+          this.laps.push(Object.assign({}, m.fields, t !== null ? { t } : {}));
+          break;
+        case 'monitoring': {
+          if (t === null) break;
+          const p = Object.assign({}, m.fields);
+          delete p.timestamp;
+          p.t = t;
+          const fp = t + '|' + JSON.stringify(p);
+          if (this._monKeys.has(fp)) break;
+          this._monKeys.add(fp);
+          this.monitoring.push(p);
+          break;
+        }
+        case 'stress_level': {
+          const tt = m.fields.stress_level_time ? Date.parse(m.fields.stress_level_time) : t;
+          if (tt === null) break;
+          const fp = tt + '|' + m.fields.stress_level_value;
+          if (this._stressKeys.has(fp)) break;
+          this._stressKeys.add(fp);
+          this.stress.push({ t: tt, value: m.fields.stress_level_value });
+          break;
+        }
+        case 'sleep_level': {
+          if (t === null) break;
+          this.sleepLevels.push({ t, level: m.fields.sleep_level });
+          break;
+        }
+        case 'hr': {
+          if (t === null) break;
+          if (typeof m.fields.filtered_bpm === 'number')
+            this.hrPoints.push({ t, bpm: m.fields.filtered_bpm });
+          break;
+        }
+        case 'monitoring_hr_data': {
+          if (t === null) break;
+          this.restingHr.push({ t, resting: m.fields.resting_heart_rate ?? null, current: m.fields.current_day_resting_heart_rate ?? null });
+          break;
+        }
+        case 'gps_metadata': {
+          if (typeof m.fields.position_lat === 'number' && typeof m.fields.position_long === 'number')
+            this.gps.push({ t, lat: m.fields.position_lat, long: m.fields.position_long, alt: m.fields.enhanced_altitude ?? null, speed: m.fields.enhanced_speed ?? null });
+          break;
+        }
+        case 'hr_zone':
+          this.hrZones.push({ index: m.fields.message_index ?? this.hrZones.length, high: m.fields.high_bpm ?? null, name: m.fields.name ?? null });
+          break;
+        case 'user_profile':
+          this.userProfile = Object.assign({}, m.fields);
+          break;
+        case 'zones_target':
+          if (typeof m.fields.max_heart_rate === 'number') this.maxHr = m.fields.max_heart_rate;
+          break;
+        default:
+          (this.other[m.name] = this.other[m.name] || []).push(m.fields);
+      }
+    }
+  }
+
+  recordsSorted() {
+    if (!this._sortedCache) this._sortedCache = Array.from(this.records.values()).sort((a, b) => a.t - b.t);
+    return this._sortedCache;
+  }
+  monitoringSorted() {
+    if (!this._monSorted) { this.monitoring.sort((a, b) => a.t - b.t); this._monSorted = true; }
+    return this.monitoring;
+  }
+  stressSorted() { return this.stress.slice().sort((a, b) => a.t - b.t); }
+  sleepSorted() { return this.sleepLevels.slice().sort((a, b) => a.t - b.t); }
+  get okCount() { return this.files.filter(f => !f.error && !f.doublon).length; }
+  get errCount() { return this.files.filter(f => f.error).length; }
+  get hasData() {
+    return this.records.size > 0 || this.sessions.length > 0 || this.monitoring.length > 0 ||
+      this.stress.length > 0 || this.sleepLevels.length > 0 || this.hrPoints.length > 0;
+  }
+
+  exportJSON() {
+    return JSON.stringify({
+      format: 'garmin-dashboard', version: 2, exportedAt: new Date().toISOString(),
+      files: this.files.map(f => ({ name: f.name, size: f.size, error: f.error || null, doublon: !!f.doublon })),
+      records: this.recordsSorted(), sessions: this.sessions, laps: this.laps,
+      monitoring: this.monitoringSorted(), stress: this.stressSorted(), sleepLevels: this.sleepSorted(),
+      hrPoints: this.hrPoints, restingHr: this.restingHr, gps: this.gps, hrZones: this.hrZones,
+      userProfile: this.userProfile, maxHr: this.maxHr, other: this.other,
+    });
+  }
+
+  static fromJSON(text) {
+    const data = JSON.parse(text);
+    if (!data || data.format !== 'garmin-dashboard') throw new Error('Ce fichier n\'est pas un export de ce dashboard.');
+    const st = new DataStore();
+    st.files = (data.files || []).map((f, i) => ({ ...f, parsed: null, error: f.error, id: i, doublon: !!f.doublon }));
+    for (const r of data.records || []) st.records.set(r.t, r);
+    for (const r of data.monitoring || []) { st.monitoring.push(r); st._monKeys.add(r.t + '|' + JSON.stringify(r)); }
+    st.sessions = data.sessions || [];
+    st._sessionKeys = new Set(st.sessions.map(s => (s.startMs ?? (s.start_time ? Date.parse(s.start_time) : 'x')) + '|' + (s.sport ?? '?') + '|' + (s.total_distance ?? '?')));
+    st.laps = data.laps || [];
+    st.stress = data.stress || [];
+    st._stressKeys = new Set(st.stress.map(s => s.t + '|' + s.value));
+    st.sleepLevels = data.sleepLevels || [];
+    st.hrPoints = data.hrPoints || [];
+    st.restingHr = data.restingHr || [];
+    st.gps = data.gps || [];
+    st.hrZones = data.hrZones || [];
+    st.userProfile = data.userProfile || {};
+    st.maxHr = data.maxHr ?? null;
+    st.other = data.other || {};
+    for (const f of st.files) if (!f.error && !f.doublon) st._fileKeys.add(f.name + '|' + f.size);
+    return st;
+  }
+}
+
+/* ============================================================================
+   COUCHE 3 — Métriques et calculs (fonctions pures, testables hors navigateur)
+   ========================================================================== */
+
+/* Registre des métriques affichables. Voir le commentaire en tête de fichier
+   pour ajouter une métrique. */
+const METRICS = {
+  // séries à la seconde (message record, zoom par séance)
+  heart_rate: { label: 'Fréquence cardiaque', unit: 'bpm', color: '#e11d48', source: 'record', field: 'heart_rate', agg: 'avg', decimals: 0, seuils: { min: 50, max: 190 } },
+  speed:      { label: 'Vitesse', unit: 'km/h', color: '#2563eb', source: 'record', field: 'speed', altField: 'enhanced_speed', agg: 'avg', decimals: 1, mul: 3.6 },
+  altitude:   { label: 'Altitude', unit: 'm', color: '#059669', source: 'record', field: 'altitude', altField: 'enhanced_altitude', agg: 'avg', decimals: 0 },
+  cadence:    { label: 'Cadence', unit: 'tr/min', color: '#d97706', source: 'record', field: 'cadence', agg: 'avg', decimals: 0 },
+  power:      { label: 'Puissance', unit: 'W', color: '#7c3aed', source: 'record', field: 'power', agg: 'avg', decimals: 0 },
+  distance:   { label: 'Distance cumulée', unit: 'km', color: '#0891b2', source: 'record', field: 'distance', agg: 'max', decimals: 2, mul: 0.001 },
+  temperature:{ label: 'Température', unit: '°C', color: '#f59e0b', source: 'record', field: 'temperature', agg: 'avg', decimals: 1 },
+  // séries monitoring (incréments par intervalle)
+  mon_hr:     { label: 'FC (monitoring)', unit: 'bpm', color: '#e11d48', source: 'mon', field: 'heart_rate', agg: 'avg', decimals: 0 },
+  mon_steps:  { label: 'Pas (par intervalle)', unit: 'pas', color: '#0891b2', source: 'mon', field: 'cycles', agg: 'sum', decimals: 0 },
+  mon_cal:    { label: 'Calories (par intervalle)', unit: 'kcal', color: '#ea580c', source: 'mon', field: 'calories', agg: 'sum', decimals: 0 },
+  // agrégats journaliers
+  steps:      { label: 'Pas', unit: 'pas', color: '#0891b2', source: 'daily', field: 'steps', monField: 'cycles', decimals: 0, agg: 'sum' },
+  calories:   { label: 'Calories', unit: 'kcal', color: '#ea580c', source: 'daily', field: 'calories', monField: 'calories', decimals: 0, agg: 'sum' },
+  dist_day:   { label: 'Distance', unit: 'km', color: '#7c3aed', source: 'daily', field: 'distance', monField: 'distance', mul: 0.001, decimals: 2, agg: 'sum' },
+  active_min: { label: 'Temps actif', unit: 'min', color: '#16a34a', source: 'daily', field: 'active_time', monField: 'active_time', mul: 1 / 60, decimals: 0, agg: 'sum' },
+  hr_avg:     { label: 'FC moyenne', unit: 'bpm', color: '#dc2626', source: 'daily', field: 'hr_avg', monField: 'heart_rate', decimals: 0, agg: 'avg' },
+  hr_min:     { label: 'FC minimale', unit: 'bpm', color: '#b91c1c', source: 'daily', field: 'hr_min', monField: 'heart_rate', decimals: 0, agg: 'min' },
+  hr_max:     { label: 'FC maximale', unit: 'bpm', color: '#f43f5e', source: 'daily', field: 'hr_max', monField: 'heart_rate', decimals: 0, agg: 'max' },
+  hr_rest:    { label: 'FC au repos', unit: 'bpm', color: '#9f1239', source: 'daily', field: 'hr_rest', decimals: 0, agg: 'last' },
+  stress:     { label: 'Stress moyen', unit: '', color: '#8b5cf6', source: 'daily', field: 'stress_avg', decimals: 0, agg: 'avg' },
+};
+const DEFAULT_THRESHOLDS = { heart_rate: { min: 50, max: 190 } };
+const PERIODES = { '1j': 1, '7j': 7, '30j': 30, '90j': 90, '365j': 365, 'tout': 0, 'custom': -1 };
+
+/* Libellés FR des enums usuelles (complètent ENUMS du profil). */
+const SPORTS_FR = { 0:'Générique', 1:'Course à pied', 2:'Vélo', 3:'Transition', 4:'Fitness', 5:'Natation', 6:'Basketball', 7:'Football', 8:'Tennis', 9:'Foot US', 10:'Entraînement', 11:'Marche', 12:'Ski de fond', 13:'Ski alpin', 14:'Snowboard', 15:'Aviron', 16:'Alpinisme', 17:'Randonnée', 18:'Multisport', 21:'Vélo électrique', 25:'Golf', 29:'Pêche', 47:'Boxe', 53:'Plongée', 62:'HIIT', 67:'Méditation', 83:'Danse', 86:'Mobilité', 254:'Tous' };
+const SUBSPORTS_FR = { 0:'Générique', 1:'Tapis roulant', 2:'Route', 3:'Sentier', 4:'Piste', 5:'Spinning', 6:'Vélo indoor', 7:'Route', 8:'Montagne', 9:'Descente', 11:'Cyclocross', 14:'Rameur indoor', 15:'Elliptique', 16:'Stepper', 17:'Natation en bassin', 18:'Eau libre', 25:'Ski indoor', 27:'Marche indoor', 43:'Yoga', 44:'Pilates', 45:'Course indoor', 53:'Plongée', 67:'Ultra', 68:'Escalade indoor', 69:'Bloc', 70:'HIIT', 78:'Triathlon', 84:'Pickleball', 85:'Padel', 94:'Squash', 254:'Tous' };
+function subSportLabel(v) { return SUBSPORTS_FR[v] || (ENUMS.sub_sport && ENUMS.sub_sport[v]) || ''; }
+const FILE_TYPES_FR = { 1:'Appareil', 2:'Réglages', 3:'Sport', 4:'Activité', 5:'Workout', 6:'Cours', 7:'Programmes', 9:'Poids', 10:'Totaux', 11:'Objectifs', 14:'Tension', 15:'Monitoring A', 20:'Résumé d\'activité', 28:'Monitoring quotidien', 32:'Monitoring B', 34:'Segment', 35:'Liste segments', 40:'Config EXD' };
+const MANUFACTURERS_FR = { 1:'Garmin', 255:'Développement' };
+const SLEEP_LEVELS_FR = { 0:'Inconnu', 1:'Éveillé', 2:'Léger', 3:'Profond', 4:'REM' };
+const SPORT_ICONS = { 1:'🏃', 2:'🚴', 5:'🏊', 11:'🚶', 12:'⛷️', 13:'🎿', 17:'🥾', 21:'🚴', 25:'⛳', 47:'🥊', 53:'🤿', 62:'⚡', 67:'🧘', 83:'💃', 0:'🏅', 4:'🏋️' };
+function sportLabel(v) { return SPORTS_FR[v] || (ENUMS.sport && ENUMS.sport[v]) || ('Sport ' + v); }
+function fileTypeLabel(v) { return FILE_TYPES_FR[v] || (ENUMS.file && ENUMS.file[v]) || ('Type ' + v); }
+function manufacturerLabel(v) { return MANUFACTURERS_FR[v] || (ENUMS.manufacturer && ENUMS.manufacturer[v]) || String(v); }
+
+/* Sous-échantillonnage LTTB : garde `threshold` points représentatifs. */
+function lttb(points, threshold) {
+  const n = points.length;
+  if (threshold >= n || threshold <= 2) return points;
+  const out = [points[0]];
+  const every = (n - 2) / (threshold - 2);
+  let a = 0;
+  for (let i = 0; i < threshold - 2; i++) {
+    const rangeStart = Math.floor((i + 1) * every) + 1;
+    const rangeEnd = Math.min(Math.floor((i + 2) * every) + 1, n);
+    let avgX = 0, avgY = 0;
+    const cnt = rangeEnd - rangeStart;
+    if (cnt <= 0) continue;
+    for (let j = rangeStart; j < rangeEnd; j++) { avgX += points[j].x; avgY += points[j].y; }
+    avgX /= cnt; avgY /= cnt;
+    let maxArea = -1, maxIdx = rangeStart;
+    const ax = points[a].x, ay = points[a].y;
+    for (let j = rangeStart; j < rangeEnd; j++) {
+      const area = Math.abs((ax - avgX) * (points[j].y - ay) - (ax - points[j].x) * (avgY - ay)) / 2;
+      if (area > maxArea) { maxArea = area; maxIdx = j; }
+    }
+    out.push(points[maxIdx]);
+    a = maxIdx;
+  }
+  out.push(points[n - 1]);
+  return out;
+}
+
+/* Champ d'une métrique 'record' : champ standard, sinon champ alternatif
+   (ex. enhanced_speed), sinon null. */
+function recordField(m) {
+  return m.field;
+}
+
+/* Série journalière d'une métrique 'record' : [{date, x, y}] — moyenne,
+   max ou somme du jour selon agg. */
+function dailySeries(records, metricKey) {
+  const m = METRICS[metricKey];
+  const byDay = new Map();
+  for (const r of records) {
+    let v = r[m.field];
+    if (typeof v !== 'number' && m.altField) v = r[m.altField];
+    if (typeof v !== 'number') continue;
+    const d = localDayKey(r.t);
+    let e = byDay.get(d);
+    if (!e) { e = { date: d, sum: 0, n: 0, max: -Infinity, min: Infinity, last: null }; byDay.set(d, e); }
+    e.sum += v; e.n++; e.last = v;
+    if (v > e.max) e.max = v;
+    if (v < e.min) e.min = v;
+  }
+  const out = [];
+  for (const e of byDay.values()) {
+    let v;
+    if (m.agg === 'sum') v = e.sum;
+    else if (m.agg === 'max') v = e.max;
+    else if (m.agg === 'min') v = e.min;
+    else if (m.agg === 'last') v = e.last;
+    else v = e.sum / e.n;
+    out.push({ date: e.date, x: dayStartMs(e.date), y: v * (m.mul || 1) });
+  }
+  out.sort((a, b) => a.x - b.x);
+  return out;
+}
+
+/* Moyenne glissante centrée (fenêtre `window` points, bords tronqués). */
+function movingAverage(series, window) {
+  const out = new Array(series.length).fill(null);
+  const half = Math.floor(window / 2);
+  for (let i = 0; i < series.length; i++) {
+    let s = 0, n = 0;
+    for (let j = Math.max(0, i - half); j <= Math.min(series.length - 1, i + half); j++) { s += series[j].y; n++; }
+    out[i] = n ? s / n : null;
+  }
+  return out;
+}
+
+/* Bornes de la période sélectionnée (ms). '1j' = aujourd'hui (minuit local),
+   'Nj' = fenêtre glissante, 'tout' = étendue de toutes les données,
+   'custom' = [custom.from, custom.to] (dates choisies, inclusif). */
+function periodBounds(periode, store, custom) {
+  const now = Date.now();
+  if (periode === 'custom' && custom && isFinite(custom.from) && isFinite(custom.to))
+    return { from: custom.from, to: custom.to + 864e5 - 1 };
+  if (periode === 'tout' || !PERIODES[periode] || PERIODES[periode] === 0 || PERIODES[periode] === -1) {
+    let min = Infinity, max = -Infinity;
+    const consider = t => { if (typeof t === 'number' && isFinite(t)) { if (t < min) min = t; if (t > max) max = t; } };
+    for (const r of store.recordsSorted()) consider(r.t);
+    for (const p of store.monitoringSorted()) consider(p.t);
+    for (const s of store.sessions) consider(s.startMs ?? s.t);
+    for (const s of store.stress) consider(s.t);
+    for (const s of store.sleepLevels) consider(s.t);
+    if (!isFinite(min)) { min = now - 30 * 864e5; max = now; }
+    return { from: min, to: Math.max(max, min + 864e5) };
+  }
+  if (periode === '1j') {
+    const d = new Date();
+    return { from: new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime(), to: now };
+  }
+  return { from: now - PERIODES[periode] * 864e5, to: now };
+}
+
+/* Agrégats journaliers calculés depuis les messages monitoring (55),
+   stress_level (227), hr (132) et monitoring_hr_data (211).
+   monitoring : calories/distance/cycles/active_time = incréments par
+   intervalle -> SOMME du jour ; heart_rate -> moyenne/min/max.
+   Retourne Map 'YYYY-MM-DD' -> {date, steps, distance, calories, active_time,
+   hr_avg, hr_min, hr_max, hr_rest, stress_avg}. */
+/* Total journalier d'un champ monitoring cumulatif-ou-incrément : si les
+   valeurs du jour sont monotones croissantes -> champ cumulatif depuis minuit
+   (total = max) ; sinon ce sont des incréments par intervalle (total = somme). */
+function aggDayValues(vals) {
+  if (!vals.length) return null;
+  let mono = vals.length >= 2;
+  for (let i = 1; i < vals.length; i++) if (vals[i] < vals[i - 1] - 1e-9) { mono = false; break; }
+  if (mono) return Math.max(...vals);
+  return vals.reduce((a, b) => a + b, 0);
+}
+function dailyAgg(store) {
+  const byDay = new Map();
+  const get = d => {
+    let e = byDay.get(d);
+    if (!e) { e = { date: d, cyc: [], dist: [], cal: [], at: [],
+      hrSum: 0, hrN: 0, hrMin: Infinity, hrMax: -Infinity, hrRest: null,
+      stressSum: 0, stressN: 0 }; byDay.set(d, e); }
+    return e;
+  };
+  for (const p of store.monitoringSorted()) {
+    const e = get(localDayKey(p.t));
+    if (typeof p.cycles === 'number') e.cyc.push(p.cycles);
+    if (typeof p.distance === 'number') e.dist.push(p.distance);
+    if (typeof p.calories === 'number') e.cal.push(p.calories);
+    if (typeof p.active_time === 'number') e.at.push(p.active_time);
+    if (typeof p.heart_rate === 'number' && p.heart_rate > 0) {
+      e.hrSum += p.heart_rate; e.hrN++;
+      if (p.heart_rate < e.hrMin) e.hrMin = p.heart_rate;
+      if (p.heart_rate > e.hrMax) e.hrMax = p.heart_rate;
+    }
+  }
+  for (const p of store.hrPoints) {
+    const e = get(localDayKey(p.t));
+    if (typeof p.bpm === 'number' && p.bpm > 0) {
+      e.hrSum += p.bpm; e.hrN++;
+      if (p.bpm < e.hrMin) e.hrMin = p.bpm;
+      if (p.bpm > e.hrMax) e.hrMax = p.bpm;
+    }
+  }
+  for (const s of store.stressSorted()) {
+    if (typeof s.value !== 'number' || s.value < 0) continue; // -1/-2 = pas de mesure
+    const e = get(localDayKey(s.t));
+    e.stressSum += s.value; e.stressN++;
+  }
+  for (const r of store.restingHr) {
+    const e = get(localDayKey(r.t));
+    if (typeof r.current === 'number' && r.current > 0) e.hrRest = r.current;
+    else if (typeof r.resting === 'number' && r.resting > 0) e.hrRest = r.resting;
+  }
+  const out = new Map();
+  for (const [d, e] of byDay) {
+    out.set(d, {
+      date: d,
+      steps: aggDayValues(e.cyc),
+      distance: aggDayValues(e.dist),
+      calories: aggDayValues(e.cal),
+      active_time: aggDayValues(e.at),
+      hr_avg: e.hrN ? e.hrSum / e.hrN : null,
+      hr_min: e.hrN ? e.hrMin : null,
+      hr_max: e.hrN ? e.hrMax : null,
+      hr_rest: e.hrRest,
+      stress_avg: e.stressN ? e.stressSum / e.stressN : null,
+    });
+  }
+  return out;
+}
+
+/* Série journalière d'une métrique 'daily' sur [from,to] :
+   [{date, x, y}] depuis dailyAgg. */
+function dailyMetricSeries(store, metricKey, from, to) {
+  const m = METRICS[metricKey];
+  const out = [];
+  for (const d of dailyAgg(store).values()) {
+    const x = dayStartMs(d.date);
+    if (x < from - 864e5 || x > to) continue;
+    if (typeof d[m.field] !== 'number') continue;
+    out.push({ date: d.date, x, y: d[m.field] * (m.mul || 1) });
+  }
+  out.sort((a, b) => a.x - b.x);
+  return out;
+}
+
+/* Série journalière d'une métrique 'record' filtrée par sport (plages des
+   séances) et par période. */
+function recordSeriesFor(store, metricKey, periode, sport, custom) {
+  let recs = store.recordsSorted();
+  if (sport && sport !== 'tout') {
+    const sess = store.sessions.filter(s => String(s.sport) === String(sport));
+    const plages = sess.map(s => {
+      const a = s.startMs ?? (s.start_time ? Date.parse(s.start_time) : null);
+      return a === null ? null : [a, a + (s.total_elapsed_time || 0) * 1000];
+    }).filter(p => p && isFinite(p[0]));
+    recs = plages.length ? recs.filter(r => plages.some(([a, b]) => r.t >= a - 6e4 && r.t <= b + 6e4)) : [];
+  }
+  const { from, to } = periodBounds(periode, store, custom);
+  const m = METRICS[metricKey];
+  const sub = recs.filter(r => r.t >= from && r.t <= to);
+  if (m.source === 'record') return { series: dailySeries(sub, metricKey), from, to };
+  if (m.source === 'daily') return { series: dailyMetricSeries(store, metricKey, from, to), from, to };
+  // source 'mon' : agrégé par jour (somme ou moyenne selon agg)
+  const byDay = new Map();
+  for (const p of store.monitoringSorted()) {
+    if (p.t < from || p.t > to) continue;
+    if (typeof p[m.field] !== 'number') continue;
+    const d = localDayKey(p.t);
+    let e = byDay.get(d);
+    if (!e) { e = { date: d, sum: 0, n: 0, max: -Infinity, min: Infinity }; byDay.set(d, e); }
+    e.sum += p[m.field]; e.n++;
+    if (p[m.field] > e.max) e.max = p[m.field];
+    if (p[m.field] < e.min) e.min = p[m.field];
+  }
+  const series = [];
+  for (const e of byDay.values()) {
+    let v = m.agg === 'sum' ? e.sum : m.agg === 'max' ? e.max : m.agg === 'min' ? e.min : e.sum / e.n;
+    series.push({ date: e.date, x: dayStartMs(e.date), y: v * (m.mul || 1) });
+  }
+  series.sort((a, b) => a.x - b.x);
+  return { series, from, to };
+}
+
+/* KPIs sur la période pour une métrique : moyenne/min/max de la série
+   journalière, tendance (7 derniers jours vs 7 précédents, sinon 2e moitié
+   vs 1re moitié), nombre de séances. */
+function computeKPIs(store, metricKey, periode, sport, custom) {
+  const m = METRICS[metricKey];
+  const { series, from, to } = recordSeriesFor(store, metricKey, periode, sport, custom);
+  const vals = series.map(p => p.y);
+  const moy = vals.length ? vals.reduce((a, b) => a + b, 0) / vals.length : null;
+  const min = vals.length ? Math.min(...vals) : null;
+  const max = vals.length ? Math.max(...vals) : null;
+  let tendance = null;
+  const W = 7 * 864e5;
+  if (to - from >= 14 * 864e5 && series.length) {
+    const recent = series.filter(p => p.x > to - W).map(p => p.y);
+    const prev = series.filter(p => p.x > to - 2 * W && p.x <= to - W).map(p => p.y);
+    if (recent.length && prev.length) {
+      const a = recent.reduce((x, y) => x + y, 0) / recent.length;
+      const b = prev.reduce((x, y) => x + y, 0) / prev.length;
+      tendance = b ? (a - b) / Math.abs(b) * 100 : null;
+    }
+  } else if (series.length >= 4) {
+    const half = Math.floor(series.length / 2);
+    const a = series.slice(half).reduce((x, p) => x + p.y, 0) / (series.length - half);
+    const b = series.slice(0, half).reduce((x, p) => x + p.y, 0) / half;
+    tendance = b ? (a - b) / Math.abs(b) * 100 : null;
+  }
+  const sess = sport && sport !== 'tout' ? store.sessions.filter(s => String(s.sport) === String(sport)) : store.sessions;
+  const seances = sess.filter(s => { const t = s.startMs ?? s.t; return t >= from && t <= to + 864e5; }).length;
+  return { moy, min, max, tendance, seances, series, from, to };
+}
+
+/* Clé de "nuit" : une tranche avant midi (heure locale) appartient à la nuit
+   commencée la veille (comme Garmin Connect : la nuit du jour J couvre
+   le soir du J jusqu'au matin du J+1). */
+function sleepDayKey(t) {
+  const d = new Date(t);
+  if (d.getHours() < 12) return localDayKey(t - 864e5);
+  return localDayKey(t);
+}
+/* Zones de fréquence cardiaque pour le graphique d'une séance :
+   depuis les messages hr_zone (8) du fichier, sinon zones par défaut en %
+   de la FC max (zones_target / user_profile, ou 220 - âge, ou 190 bpm). */
+const HR_ZONE_COLORS = ['#90a4ae', '#42a5f5', '#66bb6a', '#ffa726', '#ef5350'];
+function getHrZones(store) {
+  if (store.hrZones.length) {
+    const sorted = store.hrZones.slice().sort((a, b) => (a.index ?? 0) - (b.index ?? 0));
+    const zones = [];
+    let lo = 0;
+    for (const z of sorted) {
+      if (typeof z.high !== 'number' || z.high <= lo) continue;
+      zones.push({ y0: lo + 1, y1: z.high, color: HR_ZONE_COLORS[(z.index ?? zones.length) % HR_ZONE_COLORS.length],
+        label: 'Z' + ((z.index ?? zones.length) + 1) + (z.name ? ' · ' + z.name : '') });
+      lo = z.high;
+    }
+    if (zones.length) return { zones, fcmax: lo };
+  }
+  const age = store.userProfile.age;
+  const fcmax = store.userProfile.default_max_heart_rate || store.maxHr ||
+    (typeof age === 'number' && age > 0 ? 220 - age : 190);
+  const zones = [];
+  const bounds = [0.6, 0.7, 0.8, 0.9, 1.0];
+  let lo = Math.round(fcmax * 0.5);
+  zones.push({ y0: 0, y1: lo, color: HR_ZONE_COLORS[0], label: 'Z1 (<60 %)' });
+  for (let i = 1; i < bounds.length; i++) {
+    const hi = Math.round(fcmax * bounds[i]);
+    zones.push({ y0: lo + 1, y1: hi, color: HR_ZONE_COLORS[i], label: 'Z' + (i + 1) + ' (' + Math.round(bounds[i - 1] * 100) + '–' + Math.round(bounds[i] * 100) + ' %)' });
+    lo = hi;
+  }
+  return { zones, fcmax };
+}
+
+/* Temps passé dans chaque zone de FC, par jour, calculé depuis les records
+   (delta entre records consécutifs, plafonné à 60 s). Retourne
+   { series: [{date, x, z: {label: secondes}}], zones }. */
+function zoneTimeByDay(store, from, to) {
+  const hz = getHrZones(store);
+  if (!hz || !hz.zones || !hz.zones.length) return { series: [], zones: [] };
+  const recs = store.recordsSorted()
+    .filter(r => r.t >= from && r.t <= to && typeof r.heart_rate === 'number' && r.heart_rate > 0);
+  const byDay = new Map();
+  let prev = null;
+  for (const r of recs) {
+    if (prev && r.t > prev.t) {
+      const dt = Math.min((r.t - prev.t) / 1000, 60);
+      const zone = hz.zones.find(z => r.heart_rate >= z.y0 && r.heart_rate <= z.y1) || hz.zones[hz.zones.length - 1];
+      const d = localDayKey(r.t);
+      let e = byDay.get(d);
+      if (!e) { e = { date: d, x: dayStartMs(d), z: {} }; byDay.set(d, e); }
+      e.z[zone.label] = (e.z[zone.label] || 0) + dt;
+    }
+    prev = r;
+  }
+  const series = Array.from(byDay.values()).sort((a, b) => a.x - b.x);
+  return { series, zones: hz.zones };
+}
+
+/* Nuits de sommeil depuis sleep_level (275) : groupées par nuit (voir
+   sleepDayKey), durée = dernier - premier timestamp (+ delta moyen de la
+   dernière tranche), répartition par niveau. */
+function sleepNights(store) {
+  const pts = store.sleepSorted();
+  const byDay = new Map();
+  for (const p of pts) {
+    const d = sleepDayKey(p.t);
+    let e = byDay.get(d);
+    if (!e) { e = { date: d, levels: {} }; byDay.set(d, e); }
+    e.levels[p.level] = (e.levels[p.level] || 0) + 1;
+  }
+  const out = [];
+  for (const e of byDay.values()) {
+    const dayPts = pts.filter(p => sleepDayKey(p.t) === e.date).sort((a, b) => a.t - b.t);
+    let duree = 0;
+    if (dayPts.length >= 2) {
+      let dsum = 0;
+      for (let i = 1; i < dayPts.length; i++) dsum += dayPts[i].t - dayPts[i - 1].t;
+      duree = dsum + dsum / (dayPts.length - 1); // + durée estimée de la dernière tranche
+    }
+    out.push({ date: e.date, x: dayStartMs(e.date), t0: dayPts[0].t, t1: dayPts[dayPts.length - 1].t,
+      duree_s: duree / 1000, levels: e.levels, n: dayPts.length });
+  }
+  out.sort((a, b) => a.x - b.x);
+  return out;
+}
+
+/* ============================================================================
+   COUCHE 4 — UI (navigateur uniquement)
+   ========================================================================== */
+function initUI() {
+  let store = new DataStore();
+  let fichierSel = null;
+  let seanceSel = null;
+  const state = {
+    vue: 'accueil', periode: '30j', metrique: 'steps', metriqueAccueil: 'steps',
+    sport: 'tout', seuilMin: null, seuilMax: null,
+    zoomAccueil: null, zoomSante: null, metriqueSeance: 'heart_rate',
+    custom: null,                 // {from, to} en ms pour la période libre
+    calAnnee: null, calMois: null, // mois affiché du calendrier (null = mois courant)
+    jourFiltre: null,              // 'YYYY-MM-DD' sélectionné dans le calendrier
+  };
+
+  const $ = id => document.getElementById(id);
+  const dropZone = $('dropZone'), fileInput = $('fileInput'), jsonInput = $('jsonInput');
+
+  /* ---------- contrôles communs ---------- */
+  function fillMetriques(sourceFilter) {
+    const sel = $('selMetrique');
+    const liste = Object.entries(METRICS).filter(([, m]) => !sourceFilter || m.source === sourceFilter);
+    sel.innerHTML = liste.map(([k, m]) => '<option value="' + k + '">' + esc(m.label) + (m.unit ? ' (' + esc(m.unit) + ')' : '') + '</option>').join('');
+    if (!liste.some(([k]) => k === state.metrique)) state.metrique = liste[0][0];
+    sel.value = state.metrique;
+    const sel2 = $('selMetriqueSeance');
+    const liste2 = Object.entries(METRICS).filter(([, m]) => m.source === 'record');
+    sel2.innerHTML = liste2.map(([k, m]) => '<option value="' + k + '">' + esc(m.label) + (m.unit ? ' (' + esc(m.unit) + ')' : '') + '</option>').join('');
+    sel2.value = state.metriqueSeance;
+  }
+  function fillSports() {
+    const sel = $('selSport');
+    const sports = new Set(store.sessions.map(s => s.sport).filter(s => s !== undefined && s !== null));
+    const opts = ['<option value="tout">Tous les sports</option>'];
+    for (const sp of Array.from(sports).sort((a, b) => a - b))
+      opts.push('<option value="' + sp + '">' + esc(sportLabel(sp)) + '</option>');
+    sel.innerHTML = opts.join('');
+    if (state.sport !== 'tout' && !sports.has(Number(state.sport))) state.sport = 'tout';
+    sel.value = state.sport;
+  }
+  function applySeuilsDefauts() {
+    const d = (METRICS[state.metrique].seuils) || DEFAULT_THRESHOLDS[state.metrique] || {};
+    state.seuilMin = d.min ?? null; state.seuilMax = d.max ?? null;
+    $('seuilMin').value = d.min ?? ''; $('seuilMax').value = d.max ?? '';
+  }
+  function bindControles() {
+    fillMetriques();
+    $('selMetrique').addEventListener('change', () => {
+      state.metrique = $('selMetrique').value;
+      applySeuilsDefauts();
+      state.zoomAccueil = null; state.zoomSante = null;
+      renderVueCourante();
+    });
+    $('selMetriqueSeance').addEventListener('change', () => { state.metriqueSeance = $('selMetriqueSeance').value; renderDetailSeance(); });
+    document.querySelectorAll('#segPeriode button').forEach(b => b.addEventListener('click', () => {
+      document.querySelectorAll('#segPeriode button').forEach(x => x.classList.remove('actif'));
+      b.classList.add('actif');
+      state.periode = b.dataset.p;
+      state.zoomAccueil = null; state.zoomSante = null;
+      renderVueCourante();
+    }));
+    $('seuilMin').addEventListener('change', e => { state.seuilMin = e.target.value === '' ? null : Number(e.target.value); renderVueCourante(); });
+    $('seuilMax').addEventListener('change', e => { state.seuilMax = e.target.value === '' ? null : Number(e.target.value); renderVueCourante(); });
+    $('btnVueGlobale').addEventListener('click', () => { state.zoomAccueil = null; state.zoomSante = null; renderVueCourante(); });
+    $('selSport').addEventListener('change', e => { state.sport = e.target.value; renderVueCourante(); });
+    $('btnFermerSeance').addEventListener('click', () => { seanceSel = null; renderActivites(); });
+    $('btnVoirActivites').addEventListener('click', () => { const s = derniereSeance(); if (s) { seanceSel = s; } showVue('activites'); });
+    $('btnExportGpx').addEventListener('click', () => exportGpxSeance());
+    $('btnExportCsv').addEventListener('click', () => exportCsvJours());
+    // période libre (dates)
+    const majDates = () => {
+      const du = $('dateDu').value, au = $('dateAu').value;
+      if (du && au) {
+        state.custom = { from: new Date(du + 'T00:00:00').getTime(), to: new Date(au + 'T00:00:00').getTime() };
+        state.periode = 'custom';
+        document.querySelectorAll('#segPeriode button').forEach(x => x.classList.remove('actif'));
+      } else if (state.periode === 'custom') {
+        state.periode = '30j';
+        document.querySelector('#segPeriode button[data-p="30j"]').classList.add('actif');
+      }
+      state.zoomAccueil = null; state.zoomSante = null;
+      renderVueCourante();
+    };
+    $('dateDu').addEventListener('change', majDates);
+    $('dateAu').addEventListener('change', majDates);
+    // calendrier
+    $('calPrev').addEventListener('click', () => { decalMois(-1); });
+    $('calNext').addEventListener('click', () => { decalMois(1); });
+    window.addEventListener('resize', () => renderVueCourante());
+    document.querySelectorAll('#onglets .tab').forEach(b => b.addEventListener('click', () => showVue(b.dataset.vue)));
+  }
+  function decalMois(d) {
+    let [a, m] = [state.calAnnee ?? new Date().getFullYear(), state.calMois ?? new Date().getMonth()];
+    m += d;
+    if (m < 0) { m = 11; a--; } else if (m > 11) { m = 0; a++; }
+    state.calAnnee = a; state.calMois = m;
+    renderCalendrier();
+  }
+  function derniereSeance() {
+    if (!store.sessions.length) return null;
+    return store.sessions.slice().sort((a, b) => (b.startMs ?? b.t ?? 0) - (a.startMs ?? a.t ?? 0))[0];
+  }
+
+  /* ---------- import : fichiers, dossier, JSON ---------- */
+  $('btnParcourir').addEventListener('click', e => { e.stopPropagation(); fileInput.click(); });
+  dropZone.addEventListener('click', () => fileInput.click());
+  fileInput.addEventListener('change', () => { importFiles(fileInput.files); fileInput.value = ''; });
+  ['dragenter', 'dragover'].forEach(ev => dropZone.addEventListener(ev, e => { e.preventDefault(); dropZone.classList.add('over'); }));
+  ['dragleave', 'drop'].forEach(ev => dropZone.addEventListener(ev, e => { e.preventDefault(); dropZone.classList.remove('over'); }));
+  dropZone.addEventListener('drop', e => {
+    const json = Array.from(e.dataTransfer.files).find(f => f.name.toLowerCase().endsWith('.json'));
+    if (json) { importJsonFile(json); return; }
+    importFiles(e.dataTransfer.files);
+  });
+
+  async function importFiles(fileList) {
+    const files = Array.from(fileList).filter(f => f.name.toLowerCase().endsWith('.fit'));
+    if (!files.length) return;
+    for (const f of files) {
+      try {
+        const parsed = new FitParser().parse(await f.arrayBuffer());
+        store.addFile(f.name, f.size, parsed, null);
+      } catch (err) {
+        store.addFile(f.name, f.size, null, err.message);
+      }
+    }
+    apresImport('Import : ' + files.length + ' fichier(s) traité(s).');
+  }
+
+  $('btnExport').addEventListener('click', () => {
+    if (!store.files.length) { setStatut('<span class="err">Aucune donnée à exporter.</span>'); return; }
+    const blob = new Blob([store.exportJSON()], { type: 'application/json' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'garmin-dashboard-data.json';
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+    setStatut('Jeu de données exporté en JSON (' + store.records.size + ' points, ' + store.sessions.length + ' séance(s)).');
+  });
+  $('btnImport').addEventListener('click', () => jsonInput.click());
+  jsonInput.addEventListener('change', e => {
+    const f = e.target.files[0];
+    e.target.value = '';
+    if (f) importJsonFile(f);
+  });
+  async function importJsonFile(f) {
+    try {
+      store = DataStore.fromJSON(await f.text());
+      fichierSel = null; seanceSel = null;
+      apresImport('Jeu de données importé depuis <b>' + esc(f.name) + '</b>.');
+    } catch (err) {
+      setStatut('<span class="err">Import JSON impossible : ' + esc(err.message) + '</span>');
+    }
+  }
+
+  /* ---------- sélection de dossier (File System Access API + fallback) ---------- */
+  function idbOpen() {
+    return new Promise((res, rej) => {
+      const rq = indexedDB.open('garmin-dashboard', 1);
+      rq.onupgradeneeded = () => rq.result.createObjectStore('handles');
+      rq.onsuccess = () => res(rq.result);
+      rq.onerror = () => rej(rq.error);
+    });
+  }
+  async function saveHandle(key, handle) {
+    try {
+      const db = await idbOpen();
+      await new Promise((res, rej) => { const tx = db.transaction('handles', 'readwrite'); tx.objectStore('handles').put(handle, key); tx.oncomplete = res; tx.onerror = () => rej(tx.error); });
+    } catch (e) { /* stockage indisponible : on redemandera le dossier */ }
+  }
+  async function loadHandle(key) {
+    try {
+      const db = await idbOpen();
+      return await new Promise((res, rej) => { const tx = db.transaction('handles', 'readonly'); const rq = tx.objectStore('handles').get(key); rq.onsuccess = () => res(rq.result || null); rq.onerror = () => rej(rq.error); });
+    } catch (e) { return null; }
+  }
+  async function getDirHandle(key, mode) {
+    if (!window.showDirectoryPicker) return null;
+    const opts = { id: key, mode };
+    let h = await loadHandle(key);
+    if (h) {
+      if (await h.queryPermission(opts) === 'granted') return h;
+      if (await h.requestPermission(opts) === 'granted') return h;
+    }
+    h = await window.showDirectoryPicker(opts);
+    await saveHandle(key, h);
+    return h;
+  }
+  async function listFitFiles(dirHandle, prefix, out) {
+    for await (const [name, handle] of dirHandle.entries()) {
+      if (name.startsWith('.')) continue;
+      if (handle.kind === 'directory') await listFitFiles(handle, prefix + name + '/', out);
+      else if (name.toLowerCase().endsWith('.fit')) out.push({ rel: prefix + name, handle });
+    }
+  }
+  async function importFitEntry(entry, name) {
+    try {
+      const file = await entry.handle.getFile();
+      store.addFile(name, file.size, new FitParser().parse(await file.arrayBuffer()), null);
+    } catch (err) {
+      store.addFile(name, 0, null, err.message);
+    }
+  }
+  $('btnDossier').addEventListener('click', async () => {
+    if (window.showDirectoryPicker) {
+      let dir;
+      try { dir = await getDirHandle('garmin-data', 'read'); } catch (e) { return; }
+      if (!dir) { $('dirInput').click(); return; }
+      const entries = [];
+      await listFitFiles(dir, '', entries);
+      $('syncRapport').textContent = entries.length + ' fichier(s) .fit trouvés dans le dossier — import en cours…';
+      for (const e of entries) await importFitEntry(e, e.rel);
+      apresImport('Dossier importé : ' + entries.length + ' fichier(s) .fit lus.');
+    } else {
+      $('dirInput').click();
+    }
+  });
+  $('dirInput').addEventListener('change', async e => {
+    const files = Array.from(e.target.files).filter(f => f.name.toLowerCase().endsWith('.fit'));
+    e.target.value = '';
+    for (const f of files) {
+      try { store.addFile(f.webkitRelativePath || f.name, f.size, new FitParser().parse(await f.arrayBuffer()), null); }
+      catch (err) { store.addFile(f.webkitRelativePath || f.name, f.size, null, err.message); }
+    }
+    apresImport('Dossier importé : ' + files.length + ' fichier(s).');
+  });
+
+  /* ---------- synchro montre -> PC (ne copie que les nouveaux) ---------- */
+  let srcDirHandle = null, dstDirHandle = null;
+  function updateSyncUI() {
+    $('etape1').classList.toggle('fait', !!srcDirHandle);
+    $('etape2').classList.toggle('fait', !!dstDirHandle);
+    $('etatSrc').textContent = srcDirHandle ? '✓ ' + srcDirHandle.name : '';
+    $('etatDst').textContent = dstDirHandle ? '✓ ' + dstDirHandle.name : '';
+    $('btnLancerSync').disabled = !(srcDirHandle && dstDirHandle);
+  }
+  async function refreshEtatsSync() {
+    if (!window.showDirectoryPicker) {
+      $('syncRapport').textContent = 'La synchro de dossiers nécessite Chrome ou Edge (File System Access API). Utilisez « Sélectionner un dossier… » ou le glisser-déposer.';
+      return;
+    }
+    for (const [key, mode, set] of [['garmin-src', 'read', h => srcDirHandle = h], ['garmin-dst', 'readwrite', h => dstDirHandle = h]]) {
+      try {
+        const h = await loadHandle(key);
+        if (h && await h.queryPermission({ mode }) === 'granted') set(h);
+      } catch (e) { /* ignore */ }
+    }
+    updateSyncUI();
+  }
+  $('btnSrcDir').addEventListener('click', async () => { try { srcDirHandle = await getDirHandle('garmin-src', 'read'); } catch (e) { return; } updateSyncUI(); });
+  $('btnDstDir').addEventListener('click', async () => { try { dstDirHandle = await getDirHandle('garmin-dst', 'readwrite'); } catch (e) { return; } updateSyncUI(); });
+  $('btnLancerSync').addEventListener('click', async () => {
+    const rapport = $('syncRapport');
+    rapport.textContent = '';
+    if (!srcDirHandle || !dstDirHandle) return;
+    rapport.textContent = 'Lecture du dossier de la montre « ' + srcDirHandle.name + ' »…';
+    const entries = [];
+    await listFitFiles(srcDirHandle, '', entries);
+    let copies = 0, ignores = 0, erreurs = 0;
+    for (const e of entries) {
+      const base = e.rel.split('/').pop();
+      try {
+        const srcFile = await e.handle.getFile();
+        let ignore = false;
+        try {
+          const dstFile = await (await dstDirHandle.getFileHandle(base)).getFile();
+          if (dstFile.size === srcFile.size) ignore = true; // déjà copié (même taille)
+        } catch (err) { /* n'existe pas encore dans la destination */ }
+        if (ignore) { ignores++; continue; }
+        const parts = e.rel.split('/');
+        let dir = dstDirHandle;
+        for (let i = 0; i < parts.length - 1; i++) dir = await dir.getDirectoryHandle(parts[i], { create: true });
+        const dstH = await dir.getFileHandle(base, { create: true });
+        const w = await dstH.createWritable();
+        await w.write(await srcFile.arrayBuffer());
+        await w.close();
+        copies++;
+        store.addFile(e.rel, srcFile.size, new FitParser().parse(await srcFile.arrayBuffer()), null);
+      } catch (err) {
+        erreurs++;
+        store.addFile(e.rel, 0, null, err.message);
+      }
+    }
+    apresImport('');
+    rapport.innerHTML = 'Synchro terminée : <b>' + copies + '</b> nouveau(x) fichier(s) copié(s), ' + ignores + ' déjà présent(s), ' + erreurs + ' erreur(s) — ' + entries.length + ' .fit vus au total.';
+  });
+  refreshEtatsSync();
+
+  /* ---------- statut global + navigation ---------- */
+  function setStatut(html) { $('statut').innerHTML = html; }
+  function renderStatut() {
+    if (!store.files.length) { setStatut(''); return; }
+    const dbl = store.files.filter(f => f.doublon).length;
+    setStatut(
+      store.files.length + ' fichier(s) — <b>' + store.okCount + '</b> décodé(s), <span class="err">' + store.errCount + ' en erreur</span>' +
+      (dbl ? ', ' + dbl + ' doublon(s) ignoré(s)' : '') +
+      ' — <b>' + store.records.size + '</b> points à la seconde, <b>' + store.sessions.length + '</b> séance(s), <b>' +
+      store.monitoring.length + '</b> points monitoring, <b>' + store.stress.length + '</b> mesures stress, <b>' + store.sleepLevels.length + '</b> tranches sommeil');
+  }
+  function apresImport(msg) {
+    renderStatut();
+    renderFichiers();
+    fillSports();
+    renderVueCourante();
+    if (msg) setStatut(msg + ' ' + $('statut').innerHTML);
+    if (state.vue === 'fichiers' && store.hasData) showVue('accueil');
+  }
+  function showVue(vue) {
+    state.vue = vue;
+    document.querySelectorAll('#onglets .tab').forEach(x => x.classList.toggle('actif', x.dataset.vue === vue));
+    document.querySelectorAll('section[id^="vue-"]').forEach(s => s.style.display = 'none');
+    $('vue-' + vue).style.display = 'block';
+    const barre = $('barreControles');
+    barre.style.display = (vue === 'accueil' || vue === 'sante' || vue === 'activites') ? 'flex' : 'none';
+    $('groupeMetrique').style.display = (vue === 'accueil' || vue === 'sante') ? 'flex' : 'none';
+    $('groupeSport').style.display = vue === 'activites' ? 'flex' : 'none';
+    $('groupeSeuilMin').style.display = (vue === 'accueil' || vue === 'sante') ? 'flex' : 'none';
+    $('groupeSeuilMax').style.display = (vue === 'accueil' || vue === 'sante') ? 'flex' : 'none';
+    if (vue !== 'activites') { seanceSel = null; }
+    renderVueCourante();
+  }
+  function renderVueCourante() {
+    try {
+      if (state.vue === 'accueil') renderAccueil();
+      else if (state.vue === 'activites') renderActivites();
+      else if (state.vue === 'sante') renderSante();
+      else if (state.vue === 'sommeil') renderSommeil();
+      else if (state.vue === 'fichiers') renderFichiers();
+    } catch (e) {
+      setStatut('<span class="err">Erreur d\'affichage : ' + esc(e.message) + '</span>');
+      console.error(e);
+    }
+  }
+
+  /* ---------- onglet Fichiers : liste + détail ---------- */
+  function renderFichiers() {
+    renderStatut();
+    renderAppareil();
+    $('aucunFichier').style.display = store.files.length ? 'none' : 'block';
+    const liste = $('listeFichiers');
+    liste.innerHTML = '';
+    store.files.forEach(f => {
+      const div = document.createElement('div');
+      div.className = 'item' + (fichierSel === f.id ? ' sel' : '');
+      const counts = f.parsed ? countMessages(f.parsed) : '';
+      const fid = f.parsed && f.parsed.messages.find(m => m.name === 'file_id');
+      const typeBadge = fid && fid.fields.type !== undefined && fid.fields.type !== null
+        ? ' <span class="badge info">' + esc(fileTypeLabel(fid.fields.type)) + '</span>' : '';
+      div.innerHTML =
+        '<div class="nom">' + esc(f.name) + '</div>' +
+        '<div class="meta">' + fmtTaille(f.size) + typeBadge +
+        (f.error
+          ? ' — <span class="err">ERREUR : ' + esc(f.error) + '</span>'
+          : f.doublon
+            ? ' — <span class="badge warn">doublon ignoré</span>'
+            : ' — <span class="badge ok">décodé</span> ' + counts +
+              (f.parsed.warnings.length ? ' — <span class="badge warn">' + f.parsed.warnings.length + ' avertissement(s)</span>' : '')) +
+        '</div>';
+      div.addEventListener('click', () => { fichierSel = f.id; renderFichiers(); });
+      liste.appendChild(div);
+    });
+    renderDetail();
+  }
+  function countMessages(parsed) {
+    const c = {};
+    parsed.messages.forEach(m => { c[m.name] = (c[m.name] || 0) + 1; });
+    return Object.entries(c).map(([n, k]) => n + '×' + k).join(', ');
+  }
+  function renderDetail() {
+    const f = store.files.find(x => x.id === fichierSel);
+    const carte = $('detailFichier');
+    if (!f || f.error || !f.parsed) { carte.style.display = 'none'; return; }
+    carte.style.display = 'block';
+    $('detailTitre').textContent = f.name;
+    const fid = f.parsed.messages.find(m => m.name === 'file_id');
+    const h = f.parsed.header;
+    let meta = 'Profil ' + h.profile + ' — protocole ' + h.protocol + ' — ' + f.parsed.messages.length + ' messages — CRC ' +
+      (h.crcOk ? '<span class="badge ok">valide</span>' : '<span class="badge warn">invalide</span>');
+    if (fid) {
+      meta += ' — <b>' + esc(fileTypeLabel(fid.fields.type)) + '</b>' +
+        (fid.fields.manufacturer !== undefined && fid.fields.manufacturer !== null ? ', fabricant ' + esc(manufacturerLabel(fid.fields.manufacturer)) : '') +
+        (fid.fields.time_created ? ', créé le ' + esc(new Date(fid.fields.time_created).toLocaleString('fr-FR')) : '');
+      meta += ' <details><summary>données brutes du file_id</summary><code style="word-break:break-all">' + esc(JSON.stringify(fid.raw)) + '</code></details>';
+    }
+    if (f.parsed.warnings.length)
+      meta += '<br>' + f.parsed.warnings.map(w => '<span class="badge warn">' + esc(w) + '</span>').join(' ');
+    $('detailMeta').innerHTML = meta;
+    const sel = $('selMessage');
+    const counts = {};
+    f.parsed.messages.forEach(m => { counts[m.name] = (counts[m.name] || 0) + 1; });
+    const prev = sel.value;
+    sel.innerHTML = Object.entries(counts).map(([n, c]) => '<option value="' + esc(n) + '">' + esc(n) + ' (' + c + ')</option>').join('');
+    if (prev && counts[prev]) sel.value = prev;
+    sel.onchange = () => renderTable(f, sel.value);
+    renderTable(f, sel.value || Object.keys(counts)[0]);
+  }
+  function renderTable(f, name) {
+    const msgs = f.parsed.messages.filter(m => m.name === name).slice(0, 200);
+    const table = $('tableMessages');
+    if (!msgs.length) { table.innerHTML = '<tbody><tr><td class="petit">Aucun message de ce type.</td></tr></tbody>'; return; }
+    const cols = [];
+    msgs.forEach(m => {
+      Object.keys(m.fields).forEach(k => { if (!cols.includes(k)) cols.push(k); });
+      Object.keys(m.raw).forEach(k => { if (!cols.includes(k)) cols.push(k); });
+    });
+    let html = '<thead><tr>' + cols.map(c => '<th>' + esc(c) + '</th>').join('') + '</tr></thead><tbody>';
+    msgs.forEach(m => {
+      html += '<tr>' + cols.map(c => '<td>' + esc(fmtVal(m.fields[c] !== undefined ? m.fields[c] : m.raw[c])) + '</td>').join('') + '</tr>';
+    });
+    table.innerHTML = html + '</tbody>';
+  }
+  function fmtTaille(o) { return o < 1024 ? o + ' o' : o < 1048576 ? (o / 1024).toFixed(1) + ' Ko' : (o / 1048576).toFixed(2) + ' Mo'; }
+  function fmtVal(v) {
+    if (v === null || v === undefined) return '—';
+    if (Array.isArray(v)) return '[' + v.map(x => fmtVal(x)).join(',') + ']';
+    if (typeof v === 'number') return String(Math.round(v * 10000) / 10000);
+    return String(v);
+  }
+  function esc(s) { return String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])); }
+
+  /* ---------- formatages ---------- */
+  function fmtJour(ms) {
+    const d = new Date(ms);
+    const long = (Date.now() - ms) > 200 * 864e5;
+    return d.toLocaleDateString('fr-FR', long ? { day: '2-digit', month: '2-digit', year: '2-digit' } : { day: '2-digit', month: '2-digit' });
+  }
+  function fmtDateLong(ms) { return new Date(ms).toLocaleDateString('fr-FR', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' }); }
+  function fmtHeure(ms) { return new Date(ms).toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' }); }
+  function fmtDateHeure(ms) { return new Date(ms).toLocaleString('fr-FR', { day: '2-digit', month: '2-digit', year: '2-digit', hour: '2-digit', minute: '2-digit' }); }
+  function fmtDuree(s) {
+    if (typeof s !== 'number') return '—';
+    const h = Math.floor(s / 3600), mi = Math.floor((s % 3600) / 60), se = Math.floor(s % 60);
+    return (h ? h + ' h ' + String(mi).padStart(2, '0') + ' min' : String(mi).padStart(2, '0') + ' min ' + String(se).padStart(2, '0') + ' s');
+  }
+  function periodeLabel(p) {
+    if (p === 'custom' && state.custom) {
+      return 'du ' + new Date(state.custom.from).toLocaleDateString('fr-FR') + ' au ' + new Date(state.custom.to).toLocaleDateString('fr-FR');
+    }
+    return { '1j': 'aujourd\'hui', '7j': '7 derniers jours', '30j': '30 derniers jours', '90j': '90 derniers jours', '365j': '1 an', 'tout': 'toutes les données', 'custom': 'période libre' }[p] || p;
+  }
+  function fmtMetrique(m, v) { return v === null || v === undefined || !isFinite(v) ? '—' : v.toFixed(m.decimals) + (m.unit ? ' ' + m.unit : ''); }
+  function kpiCard(label, valueHtml, sous, sel) {
+    return '<div class="kpi' + (sel ? ' sel' : '') + '"><div class="label">' + esc(label) + '</div><div class="value">' + valueHtml + '</div><div class="sous">' + sous + '</div></div>';
+  }
+  function tendanceHtml(t) {
+    if (t === null || !isFinite(t)) return '<span class="tendance neutre">—</span>';
+    const pct = Math.abs(t).toFixed(0) + ' %';
+    return '<span class="tendance ' + (t > 0 ? 'haut">▲ +' : t < 0 ? 'bas">▼ −' : 'neutre">= ') + pct + '</span>';
+  }
+
+  /* ---------- moteur graphique (Canvas, dessiné à la main) ---------- */
+  function prepCanvas(cv) {
+    const dpr = window.devicePixelRatio || 1;
+    const r = cv.getBoundingClientRect();
+    cv.width = Math.max(1, r.width * dpr); cv.height = Math.max(1, r.height * dpr);
+    const ctx = cv.getContext('2d');
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    return { ctx, w: r.width, h: r.height };
+  }
+  /* Graphique en ligne. opts: {color, ma, seuilMin, seuilMax, horsSeuil, fmtX, fmtY, barres, onPick}
+     Retourne {X, Y, points}. */
+  function drawLineChart(cv, points, opts) {
+    const { ctx, w, h } = prepCanvas(cv);
+    ctx.clearRect(0, 0, w, h);
+    const p = { t: 14, r: 14, b: 30, l: 58 };
+    const cw = w - p.l - p.r, ch = h - p.t - p.b;
+    const finite = points.filter(q => q.y !== null && isFinite(q.y));
+    if (!points.length || !finite.length) {
+      ctx.fillStyle = '#94a3b8'; ctx.font = '13px sans-serif'; ctx.textAlign = 'center';
+      ctx.fillText(opts.msgVide || 'Aucune donnée sur cette période', w / 2, h / 2);
+      return { X: null, Y: null, points };
+    }
+    const xs = points.map(q => q.x);
+    let xMin = Math.min(...xs), xMax = Math.max(...xs);
+    if (xMin === xMax) { xMin -= 432e5; xMax += 432e5; }
+    let yMin = Math.min(...finite.map(q => q.y)), yMax = Math.max(...finite.map(q => q.y));
+    if (opts.barres) { yMin = Math.min(0, yMin); }
+    if (yMin === yMax) { yMin -= 1; yMax += 1; }
+    const pad = (yMax - yMin) * 0.08; yMin -= pad; if (!opts.barres) yMax += pad; else yMax += pad;
+    const X = x => p.l + (x - xMin) / (xMax - xMin) * cw;
+    const Y = y => p.t + ch - (y - yMin) / (yMax - yMin) * ch;
+    // bandes de zones (ex. zones de FC) en fond
+    if (opts.zones) {
+      for (const z of opts.zones) {
+        if (z.y1 <= yMin || z.y0 >= yMax) continue;
+        ctx.globalAlpha = 0.13;
+        ctx.fillStyle = z.color;
+        ctx.fillRect(p.l, Y(Math.min(z.y1, yMax)), cw, Y(Math.max(z.y0, yMin)) - Y(Math.min(z.y1, yMax)));
+        ctx.globalAlpha = 1;
+      }
+    }
+    // grille + axe Y
+    ctx.font = '11px sans-serif'; ctx.textAlign = 'right'; ctx.textBaseline = 'middle';
+    for (let i = 0; i <= 4; i++) {
+      const y = yMin + (yMax - yMin) * i / 4;
+      const py = Y(y);
+      ctx.strokeStyle = '#eef2f7'; ctx.beginPath(); ctx.moveTo(p.l, py); ctx.lineTo(p.l + cw, py); ctx.stroke();
+      ctx.fillStyle = '#94a3b8';
+      ctx.fillText(opts.fmtY(y), p.l - 8, py);
+    }
+    // axe X
+    ctx.textAlign = 'center'; ctx.textBaseline = 'top';
+    const nTicks = Math.min(8, Math.max(2, Math.floor(cw / 90)));
+    for (let i = 0; i <= nTicks; i++) {
+      const x = xMin + (xMax - xMin) * i / nTicks;
+      ctx.fillStyle = '#94a3b8';
+      ctx.fillText(opts.fmtX(x), X(x), p.t + ch + 8);
+    }
+    // seuils en pointillés
+    for (const [val, coul] of [[opts.seuilMin, '#d97706'], [opts.seuilMax, '#dc2626']]) {
+      if (val === null || val === undefined || !isFinite(val)) continue;
+      ctx.strokeStyle = coul; ctx.setLineDash([6, 5]); ctx.lineWidth = 1.5;
+      ctx.beginPath(); ctx.moveTo(p.l, Y(val)); ctx.lineTo(p.l + cw, Y(val)); ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.fillStyle = coul; ctx.textAlign = 'left';
+      ctx.fillText('seuil ' + opts.fmtY(val), p.l + 6, Y(val) - 8);
+    }
+    if (opts.barres) {
+      // barres (ex. durée de sommeil par nuit)
+      const bw = Math.max(2, cw / points.length * 0.6);
+      ctx.fillStyle = opts.color;
+      for (const q of points) {
+        if (q.y === null || !isFinite(q.y)) continue;
+        ctx.fillRect(X(q.x) - bw / 2, Y(q.y), bw, Y(0) - Y(q.y));
+      }
+    } else {
+      // courbe (sous-échantillonnée LTTB si besoin)
+      const MAXPTS = 1200;
+      const draw = lttb(points, MAXPTS);
+      ctx.strokeStyle = opts.color; ctx.lineWidth = 2; ctx.beginPath();
+      let started = false;
+      for (const q of draw) {
+        if (q.y === null || !isFinite(q.y)) { started = false; continue; }
+        if (!started) { ctx.moveTo(X(q.x), Y(q.y)); started = true; } else ctx.lineTo(X(q.x), Y(q.y));
+      }
+      ctx.stroke();
+    }
+    // points hors seuil
+    if (opts.horsSeuil && !opts.barres) {
+      ctx.fillStyle = '#dc2626';
+      for (const q of points) {
+        if (q.y === null || !isFinite(q.y)) continue;
+        if ((opts.seuilMin !== null && opts.seuilMin !== undefined && q.y < opts.seuilMin) ||
+            (opts.seuilMax !== null && opts.seuilMax !== undefined && q.y > opts.seuilMax)) {
+          ctx.beginPath(); ctx.arc(X(q.x), Y(q.y), 3.5, 0, 7); ctx.fill();
+        }
+      }
+    }
+    // moyenne glissante
+    if (opts.ma) {
+      ctx.strokeStyle = '#0f172a'; ctx.lineWidth = 1.6; ctx.setLineDash([2, 3]); ctx.beginPath();
+      let st = false;
+      for (let i = 0; i < points.length; i++) {
+        const v = opts.ma[i];
+        if (v === null || !isFinite(v)) { st = false; continue; }
+        if (!st) { ctx.moveTo(X(points[i].x), Y(v)); st = true; } else ctx.lineTo(X(points[i].x), Y(v));
+      }
+      ctx.stroke(); ctx.setLineDash([]);
+    }
+    return { X, Y, points };
+  }
+  /* Tooltip + clic (zoom jour) sur un graphique. */
+  function bindChartInteractions(cv, tipEl, map, series, fmtValPt, onPick) {
+    if (!map.X) return;
+    cv.onmousemove = e => {
+      const r = cv.getBoundingClientRect();
+      const mx = e.clientX - r.left;
+      let best = null, bd = 1e18;
+      for (const q of series) { const d = Math.abs(map.X(q.x) - mx); if (d < bd) { bd = d; best = q; } }
+      if (best && bd < 30 && best.y !== null && isFinite(best.y)) {
+        tipEl.style.display = 'block';
+        tipEl.style.left = map.X(best.x) + 'px';
+        tipEl.style.top = map.Y(best.y) + 'px';
+        tipEl.textContent = fmtValPt(best);
+      } else tipEl.style.display = 'none';
+    };
+    cv.onmouseleave = () => { tipEl.style.display = 'none'; };
+    if (onPick) cv.onclick = e => {
+      const r = cv.getBoundingClientRect();
+      const mx = e.clientX - r.left;
+      let best = null, bd = 1e18;
+      for (const q of series) { const d = Math.abs(map.X(q.x) - mx); if (d < bd) { bd = d; best = q; } }
+      if (best) onPick(best);
+    };
+  }
+  function legendeHtml(m, opts) {
+    let h = '';
+    if (!opts.barres) h += '<span class="item"><span class="trait" style="border-color:' + m.color + '"></span>' + esc(m.label) + '</span>';
+    else h += '<span class="item"><span class="trait" style="border-color:' + m.color + '"></span>' + esc(m.label) + '</span>';
+    if (opts.ma) h += '<span class="item"><span class="trait pointille" style="border-color:#0f172a"></span>Moyenne glissante 7 j</span>';
+    if (opts.seuilMin !== null && opts.seuilMin !== undefined) h += '<span class="item"><span class="trait pointille" style="border-color:#d97706"></span>Seuil min</span>';
+    if (opts.seuilMax !== null && opts.seuilMax !== undefined) h += '<span class="item"><span class="trait pointille" style="border-color:#dc2626"></span>Seuil max</span>';
+    if (opts.horsSeuil) h += '<span class="item"><span style="color:#dc2626">●</span>Hors seuil</span>';
+    if (opts.zones) for (const z of opts.zones) h += '<span class="item"><span style="display:inline-block;width:10px;height:10px;border-radius:2px;background:' + z.color + '"></span>' + esc(z.label) + '</span>';
+    h += '<span class="item petit">clic sur un point = détail de la journée</span>';
+    return h;
+  }
+  /* Barres empilées (temps dans les zones de FC par jour). */
+  function drawStackedBars(cv, series, zones) {
+    const { ctx, w, h } = prepCanvas(cv);
+    ctx.clearRect(0, 0, w, h);
+    const p = { t: 14, r: 14, b: 30, l: 58 };
+    const cw = w - p.l - p.r, ch = h - p.t - p.b;
+    if (!series.length) {
+      ctx.fillStyle = '#94a3b8'; ctx.font = '13px sans-serif'; ctx.textAlign = 'center';
+      ctx.fillText('Aucune donnée de fréquence cardiaque sur la période', w / 2, h / 2);
+      return;
+    }
+    const xs = series.map(s => s.x);
+    let xMin = Math.min(...xs), xMax = Math.max(...xs);
+    if (xMin === xMax) { xMin -= 432e5; xMax += 432e5; }
+    const totals = series.map(s => zones.reduce((a, z) => a + (s.z[z.label] || 0), 0));
+    let yMax = Math.max(...totals);
+    if (yMax <= 0) yMax = 1;
+    yMax *= 1.08;
+    const X = x => p.l + (x - xMin) / (xMax - xMin) * cw;
+    const Y = y => p.t + ch - (y / yMax) * ch;
+    ctx.font = '11px sans-serif'; ctx.textAlign = 'right'; ctx.textBaseline = 'middle';
+    for (let i = 0; i <= 4; i++) {
+      const y = yMax * i / 4;
+      ctx.strokeStyle = '#eef2f7'; ctx.beginPath(); ctx.moveTo(p.l, Y(y)); ctx.lineTo(p.l + cw, Y(y)); ctx.stroke();
+      ctx.fillStyle = '#94a3b8';
+      ctx.fillText((y / 60).toFixed(y >= 3600 ? 1 : 0) + ' min', p.l - 8, Y(y));
+    }
+    ctx.textAlign = 'center'; ctx.textBaseline = 'top';
+    const nTicks = Math.min(8, Math.max(2, Math.floor(cw / 90)));
+    for (let i = 0; i <= nTicks; i++) {
+      const x = xMin + (xMax - xMin) * i / nTicks;
+      ctx.fillStyle = '#94a3b8';
+      ctx.fillText(fmtJour(x), X(x), p.t + ch + 8);
+    }
+    const bw = Math.max(2, cw / series.length * 0.6);
+    for (const s of series) {
+      let yAcc = 0;
+      for (const z of zones) {
+        const v = s.z[z.label] || 0;
+        if (!v) continue;
+        ctx.fillStyle = z.color;
+        ctx.fillRect(X(s.x) - bw / 2, Y(yAcc + v), bw, Y(yAcc) - Y(yAcc + v));
+        yAcc += v;
+      }
+    }
+  }
+  /* Mini-graphique (sparkline) pour les cartes KPI : courbe seule, sans axes. */
+  function drawSpark(cv, series, color) {
+    const { ctx, w, h } = prepCanvas(cv);
+    ctx.clearRect(0, 0, w, h);
+    const pts = series.filter(q => q.y !== null && isFinite(q.y));
+    if (!pts.length) return;
+    const ys = pts.map(q => q.y);
+    let yMin = Math.min(...ys), yMax = Math.max(...ys);
+    if (yMin === yMax) { yMin -= 1; yMax += 1; }
+    const X = i => (i / (pts.length - 1 || 1)) * (w - 4) + 2;
+    const Y = y => h - 3 - (y - yMin) / (yMax - yMin) * (h - 6);
+    ctx.strokeStyle = color; ctx.lineWidth = 1.6; ctx.beginPath();
+    pts.forEach((q, i) => { const x = X(i), y = Y(q.y); if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y); });
+    ctx.stroke();
+    ctx.lineTo(X(pts.length - 1), h); ctx.lineTo(2, h); ctx.closePath();
+    ctx.globalAlpha = 0.12; ctx.fillStyle = color; ctx.fill();
+    ctx.globalAlpha = 1;
+  }
+  /* Points d'une métrique pour le zoom jour (détail horaire/seconde). */
+  function zoomPoints(metricKey, dayKey) {
+    const m = METRICS[metricKey];
+    const t0 = dayStartMs(dayKey), t1 = t0 + 864e5;
+    if (m.field === 'stress_avg') { // zoom stress : valeurs stress_level de la journée
+      return store.stressSorted()
+        .filter(s => s.t >= t0 && s.t < t1 && typeof s.value === 'number' && s.value >= 0)
+        .map(s => ({ x: s.t, y: s.value, date: dayKey }));
+    }
+    if (m.field === 'hr_rest') { // zoom FC repos : monitoring_hr_data de la journée
+      return store.restingHr
+        .filter(r => r.t >= t0 && r.t < t1)
+        .map(r => ({ x: r.t, y: (r.current ?? r.resting ?? null), date: dayKey }))
+        .filter(p => p.y !== null);
+    }
+    if (m.source === 'record') {
+      return store.recordsSorted()
+        .filter(r => r.t >= t0 && r.t < t1)
+        .map(r => {
+          let v = r[m.field];
+          if (typeof v !== 'number' && m.altField) v = r[m.altField];
+          return { x: r.t, y: (typeof v === 'number' ? v * (m.mul || 1) : null), date: dayKey };
+        });
+    }
+    if (m.source === 'mon' || (m.source === 'daily' && m.monField)) {
+      const f = m.source === 'mon' ? m.field : m.monField;
+      return store.monitoringSorted()
+        .filter(p => p.t >= t0 && p.t < t1 && typeof p[f] === 'number')
+        .map(p => ({ x: p.t, y: p[f] * (m.mul || 1), date: dayKey }));
+    }
+    return [];
+  }
+  /* Dessine le graphique principal + zoom d'une vue (accueil ou santé). */
+  function renderGraphiqueVue(prefix, metricKey, series, zoomJour, setZoom) {
+    const m = METRICS[metricKey];
+    $('titreGraph' + prefix).textContent = m.label + ' — par jour (' + periodeLabel(state.periode) + ')';
+    const ma = movingAverage(series, 7);
+    const opts = {
+      color: m.color, ma,
+      seuilMin: state.seuilMin, seuilMax: state.seuilMax, horsSeuil: true,
+      fmtX: fmtJour, fmtY: v => v.toFixed(m.decimals),
+    };
+    const map = drawLineChart($(prefix === 'Accueil' ? 'chartAccueil' : 'chartSante'), series, opts);
+    $('legende' + prefix).innerHTML = legendeHtml(m, opts);
+    const tip = $(prefix === 'Accueil' ? 'tooltip' : 'tooltip3');
+    bindChartInteractions($(prefix === 'Accueil' ? 'chartAccueil' : 'chartSante'), tip, map, series,
+      q => fmtJour(q.x) + ' — ' + fmtMetrique(m, q.y),
+      q => { setZoom(q.date); });
+    // zoom
+    const zoomCarte = $('zoomCarte' + prefix), cvZ = $(prefix === 'Accueil' ? 'zoomAccueil' : 'zoomSante');
+    if (zoomJour) {
+      const pts = zoomPoints(metricKey, zoomJour);
+      $('titreZoom' + prefix).textContent = 'Détail du ' + fmtDateLong(dayStartMs(zoomJour)) + ' — ' + m.label + ' (' + pts.length + ' points' + (m.source === 'daily' ? ', par intervalle monitoring' : '') + ')';
+      zoomCarte.style.display = 'block';
+      drawLineChart(cvZ, pts, { color: m.color, seuilMin: state.seuilMin, seuilMax: state.seuilMax, horsSeuil: true, fmtX: fmtHeure, fmtY: v => v.toFixed(m.decimals) });
+    } else zoomCarte.style.display = 'none';
+    $('btnVueGlobale').style.display = (state.zoomAccueil || state.zoomSante) ? 'inline-block' : 'none';
+  }
+
+  /* ---------- TABLEAU DE BORD (accueil) ---------- */
+  function renderAccueil() {
+    const has = store.hasData;
+    $('bandeauVide').style.display = has ? 'none' : 'block';
+    $('contenuAccueil').style.display = has ? 'block' : 'none';
+    if (!has) return;
+    if (!METRICS[state.metriqueAccueil] || (METRICS[state.metriqueAccueil].source === 'record' && !store.records.size)) state.metriqueAccueil = store.monitoring.length || store.stress.length ? 'steps' : 'heart_rate';
+    // cartes KPI cliquables (style Garmin Connect)
+    const { from, to } = periodBounds(state.periode, store, state.custom);
+    const agg = dailyAgg(store);
+    const kpis = [];
+    const seances = computeKPIs(store, state.metriqueAccueil, state.periode, 'tout', state.custom).seances;
+    kpis.push({ label: 'Séances', value: String(seances), sous: periodeLabel(state.periode), action: 'activites' });
+    const sumField = (f, mul) => { let s = 0; for (const v of agg.values()) { const x = dayStartMs(v.date); if (x >= from - 864e5 && x <= to && typeof v[f] === 'number') s += v[f]; } return s * (mul || 1); };
+    kpis.push({ label: 'Pas', value: Math.round(sumField('steps')).toLocaleString('fr-FR'), sous: periodeLabel(state.periode), met: 'steps' });
+    kpis.push({ label: 'Calories', value: Math.round(sumField('calories')).toLocaleString('fr-FR') + ' kcal', sous: periodeLabel(state.periode), met: 'calories' });
+    kpis.push({ label: 'Distance', value: (sumField('distance', 0.001)).toFixed(1) + ' km', sous: periodeLabel(state.periode), met: 'dist_day' });
+    kpis.push({ label: 'FC moyenne', value: avgField('hr_avg') + ' bpm', sous: periodeLabel(state.periode), met: 'hr_avg' });
+    kpis.push({ label: 'FC au repos', value: (lastField('hr_rest') ?? '—') + (lastField('hr_rest') ? ' bpm' : ''), sous: 'dernière valeur', met: 'hr_rest' });
+    kpis.push({ label: 'Stress moyen', value: avgField('stress_avg') + (aggHas('stress_avg') ? '' : ' —'), sous: periodeLabel(state.periode), met: 'stress' });
+    const nuits = sleepNights(store).filter(n => n.x >= from - 864e5 && n.x <= to);
+    const dern = nuits.length ? nuits[nuits.length - 1] : null;
+    kpis.push({ label: 'Sommeil', value: dern ? fmtDuree(dern.duree_s) : '—', sous: dern ? 'nuit du ' + fmtJour(dern.x) : 'aucune donnée', action: 'sommeil' });
+    function avgField(f) { let s = 0, n = 0; for (const v of agg.values()) { const x = dayStartMs(v.date); if (x >= from - 864e5 && x <= to && typeof v[f] === 'number') { s += v[f]; n++; } } return n ? Math.round(s / n) : '—'; }
+    function lastField(f) { let last = null; for (const v of agg.values()) { const x = dayStartMs(v.date); if (x >= from - 864e5 && x <= to && typeof v[f] === 'number') last = v[f]; } return last === null ? null : Math.round(last); }
+    function aggHas(f) { for (const v of agg.values()) if (typeof v[f] === 'number') return true; return false; }
+    // tendance 7 j vs 7 j précédents pour la métrique sélectionnée (affichée dans sa carte)
+    let sousSel = null;
+    if (METRICS[state.metriqueAccueil] && METRICS[state.metriqueAccueil].source !== 'record') {
+      const kt = computeKPIs(store, state.metriqueAccueil, state.periode, 'tout', state.custom);
+      if (kt.tendance !== null && isFinite(kt.tendance))
+        sousSel = 'tendance ' + (kt.tendance > 0 ? '▲ +' : kt.tendance < 0 ? '▼ −' : '= ') + Math.abs(kt.tendance).toFixed(0) + ' % vs 7 j préc.';
+    }
+    $('kpiAccueil').innerHTML = kpis.map(k => {
+      const sel = k.met && k.met === state.metriqueAccueil ? ' sel' : '';
+      const cible = k.action || '';
+      const spark = k.met ? '<canvas class="spark" data-met="' + k.met + '"></canvas>' : '';
+      const sous = (sel && sousSel) ? sousSel : k.sous;
+      return '<div class="kpi' + sel + '" data-met="' + (k.met || '') + '" data-vue-cible="' + cible + '"><div class="label">' + esc(k.label) + '</div><div class="value">' + k.value + '</div>' + spark + '<div class="sous">' + esc(sous) + '</div></div>';
+    }).join('');
+    // sparklines des cartes KPI (série journalière de chaque métrique)
+    document.querySelectorAll('#kpiAccueil .kpi .spark').forEach(cv => {
+      const mm = METRICS[cv.dataset.met];
+      if (!mm) return;
+      const { series } = recordSeriesFor(store, cv.dataset.met, state.periode, 'tout', state.custom);
+      drawSpark(cv, series, mm.color);
+    });
+    document.querySelectorAll('#kpiAccueil .kpi').forEach(el => el.addEventListener('click', () => {
+      if (el.dataset.met) {
+        state.metriqueAccueil = el.dataset.met;
+        state.metrique = el.dataset.met;
+        $('selMetrique').value = el.dataset.met;
+        applySeuilsDefauts();
+        state.zoomAccueil = null;
+        renderAccueil();
+      } else if (el.dataset.vueCible) showVue(el.dataset.vueCible);
+    }));
+    // carte « dernière activité » (style Garmin Connect)
+    renderDerniereActivite();
+    // graphique principal (métrique sélectionnée)
+    const m = METRICS[state.metriqueAccueil];
+    const { series } = recordSeriesFor(store, state.metriqueAccueil, state.periode, 'tout', state.custom);
+    renderGraphiqueVue('Accueil', state.metriqueAccueil, series, state.zoomAccueil, d => { state.zoomAccueil = d; renderAccueil(); });
+    // tableau : séances récentes (record) ou derniers jours (daily)
+    if (m.source === 'record') renderTableSeances($('tableAccueil'), $('titreTableAccueil'), from, to, 'tout');
+    else renderTableJours($('tableAccueil'), $('titreTableAccueil'), series);
+  }
+
+  /* Carte « Dernière activité » avec sparkline de FC de la séance. */
+  function renderDerniereActivite() {
+    const s = derniereSeance();
+    const carte = $('carteDerniere');
+    if (!s) { carte.style.display = 'none'; return; }
+    carte.style.display = 'block';
+    const t = s.startMs ?? s.t;
+    const plage = seancePlage(s);
+    const icon = SPORT_ICONS[s.sport] || '🏅';
+    $('derniereActivite').innerHTML =
+      '<div class="seance"><div class="icone">' + icon + '</div><div class="corps" style="flex:1">' +
+      '<div class="titre">' + esc(sportLabel(s.sport)) + (s.sub_sport ? ' · ' + subSportLabel(s.sub_sport) : '') + ' — ' + (t ? fmtDateHeure(t) : '—') + '</div>' +
+      '<div class="chiffres">' +
+      '<span>⏱ ' + (s.total_elapsed_time ? fmtDuree(s.total_elapsed_time) : '—') + '</span>' +
+      '<span>📏 ' + (typeof s.total_distance === 'number' ? (s.total_distance / 1000).toFixed(2) + ' km' : '—') + '</span>' +
+      '<span>🔥 ' + (s.total_calories ?? '—') + ' kcal</span>' +
+      '<span>❤️ ' + (s.avg_heart_rate ?? '—') + '/' + (s.max_heart_rate ?? '—') + ' bpm</span>' +
+      (typeof s.total_ascent === 'number' && s.total_ascent > 0 ? '<span>⛰ +' + Math.round(s.total_ascent) + ' m</span>' : '') +
+      '</div>' +
+      '<canvas id="sparkDerniere" style="width:100%;height:56px;display:block;margin-top:8px"></canvas>' +
+      '</div></div>';
+    if (plage) {
+      const pts = store.recordsSorted()
+        .filter(r => r.t >= plage[0] - 6e4 && r.t <= plage[1] + 6e4 && typeof r.heart_rate === 'number')
+        .map(r => ({ x: r.t, y: r.heart_rate }));
+      drawSpark($('sparkDerniere'), pts, '#e11d48');
+    }
+  }
+
+  /* ---------- ACTIVITÉS ---------- */
+  function seancePlage(s) {
+    const a = s.startMs ?? (s.start_time ? Date.parse(s.start_time) : (s.t ?? null));
+    if (a === null) return null;
+    return [a, a + (s.total_elapsed_time || s.total_timer_time || 0) * 1000];
+  }
+  function renderActivites() {
+    const { from, to } = periodBounds(state.periode, store, state.custom);
+    let rows = store.sessions
+      .filter(s => state.sport === 'tout' || String(s.sport) === String(state.sport))
+      .filter(s => { const t = s.startMs ?? s.t; return t >= from - 1 && t <= to + 864e5; })
+      .sort((a, b) => (b.startMs ?? b.t ?? 0) - (a.startMs ?? a.t ?? 0));
+    const has = store.sessions.length > 0;
+    $('bandeauVideActivites').style.display = has ? 'none' : 'block';
+    $('contenuActivites').style.display = has ? 'block' : 'none';
+    if (!has) return;
+    renderCalendrier();
+    if (state.jourFiltre) rows = rows.filter(s => localDayKey(s.startMs ?? s.t ?? 0) === state.jourFiltre);
+    $('nbSeances').textContent = '(' + rows.length + ' affichée(s)' + (state.jourFiltre ? ' le ' + state.jourFiltre : '') + ' — ' + store.sessions.length + ' au total)';
+    const liste = $('listeSeances');
+    liste.innerHTML = '';
+    rows.slice(0, 50).forEach(s => {
+      const t = s.startMs ?? s.t;
+      const div = document.createElement('div');
+      div.className = 'item' + (seanceSel === s ? ' sel' : '');
+      const icon = SPORT_ICONS[s.sport] || '🏅';
+      const sub = s.sub_sport !== undefined && s.sub_sport !== null && s.sub_sport !== 0 && s.sub_sport !== 254 ? ' · ' + subSportLabel(s.sub_sport) : '';
+      div.innerHTML =
+        '<div class="seance"><div class="icone">' + icon + '</div><div class="corps">' +
+        '<div class="titre">' + esc(sportLabel(s.sport)) + sub + ' — ' + (t ? fmtDateHeure(t) : '—') + '</div>' +
+        '<div class="chiffres">' +
+        '<span>⏱ ' + (s.total_elapsed_time ? fmtDuree(s.total_elapsed_time) : '—') + '</span>' +
+        '<span>📏 ' + (typeof s.total_distance === 'number' ? (s.total_distance / 1000).toFixed(2) + ' km' : '—') + '</span>' +
+        '<span>🔥 ' + (s.total_calories ?? '—') + ' kcal</span>' +
+        '<span>❤️ ' + (s.avg_heart_rate ?? '—') + '/' + (s.max_heart_rate ?? '—') + ' bpm</span>' +
+        (typeof s.total_ascent === 'number' && s.total_ascent > 0 ? '<span>⛰ +' + Math.round(s.total_ascent) + ' m</span>' : '') +
+        '</div></div></div>';
+      div.addEventListener('click', () => { seanceSel = s; renderActivites(); });
+      liste.appendChild(div);
+    });
+    renderDetailSeance();
+  }
+
+  /* Calendrier du mois affiché : chaque jour avec activité est cliquable
+     (filtre la liste des séances sur ce jour). */
+  function renderCalendrier() {
+    const cal = $('calendrier');
+    const now = new Date();
+    let a = state.calAnnee, mo = state.calMois;
+    if (a === null || mo === null) {
+      // par défaut : mois de la dernière séance, sinon mois courant
+      const s = derniereSeance();
+      if (s && (s.startMs ?? s.t)) { const d0 = new Date(s.startMs ?? s.t); a = d0.getFullYear(); mo = d0.getMonth(); }
+      else { a = now.getFullYear(); mo = now.getMonth(); }
+    }
+    state.calAnnee = a; state.calMois = mo;
+    $('calTitre').textContent = 'Calendrier — ' + new Date(a, mo, 1).toLocaleDateString('fr-FR', { month: 'long', year: 'numeric' });
+    const parJour = new Map();
+    for (const s of store.sessions) {
+      const t = s.startMs ?? s.t;
+      if (!t) continue;
+      const d = localDayKey(t);
+      let e = parJour.get(d);
+      if (!e) { e = { n: 0, duree: 0 }; parJour.set(d, e); }
+      e.n++; e.duree += s.total_elapsed_time || 0;
+    }
+    const startOffset = (new Date(a, mo, 1).getDay() + 6) % 7; // lundi = 0
+    const daysInMonth = new Date(a, mo + 1, 0).getDate();
+    let html = ['Lun', 'Mar', 'Mer', 'Jeu', 'Ven', 'Sam', 'Dim'].map(s => '<div class="sem">' + s + '</div>').join('');
+    for (let i = 0; i < startOffset; i++) html += '<div class="case"></div>';
+    for (let j = 1; j <= daysInMonth; j++) {
+      const key = a + '-' + String(mo + 1).padStart(2, '0') + '-' + String(j).padStart(2, '0');
+      const e = parJour.get(key);
+      const cls = 'case' + (e ? ' has' : '') + (state.jourFiltre === key ? ' sel' : '');
+      html += '<div class="' + cls + '" data-jour="' + key + '"><span class="j">' + j + '</span>' +
+        (e ? '<span class="act">' + e.n + ' act. · ' + (e.duree >= 3600 ? Math.round(e.duree / 3600) + ' h' : Math.round(e.duree / 60) + ' min') + '</span>' : '') +
+        '</div>';
+    }
+    cal.innerHTML = html;
+    cal.querySelectorAll('.case.has').forEach(c => c.addEventListener('click', () => {
+      state.jourFiltre = state.jourFiltre === c.dataset.jour ? null : c.dataset.jour;
+      renderActivites();
+    }));
+    $('calFiltre').textContent = state.jourFiltre
+      ? 'Filtré sur le ' + new Date(state.jourFiltre + 'T12:00:00').toLocaleDateString('fr-FR', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' }) + ' — recliquez sur le jour pour tout réafficher.'
+      : '';
+  }
+  function renderDetailSeance() {
+    const carte = $('detailSeance');
+    if (!seanceSel) { carte.style.display = 'none'; return; }
+    const s = seanceSel;
+    const plage = seancePlage(s);
+    carte.style.display = 'block';
+    $('titreSeance').textContent = sportLabel(s.sport) + ' — ' + (plage ? fmtDateHeure(plage[0]) : '—');
+    $('kpiSeance').innerHTML =
+      kpiCard('Durée', s.total_elapsed_time ? fmtDuree(s.total_elapsed_time) : '—', '') +
+      kpiCard('Distance', typeof s.total_distance === 'number' ? (s.total_distance / 1000).toFixed(2) + ' km' : '—', '') +
+      kpiCard('Calories', (s.total_calories ?? '—') + (s.total_calories ? ' kcal' : ''), '') +
+      kpiCard('FC moyenne', (s.avg_heart_rate ?? '—') + (s.avg_heart_rate ? ' bpm' : ''), 'max ' + (s.max_heart_rate ?? '—')) +
+      kpiCard('Vitesse moy', typeof (s.avg_speed ?? s.enhanced_avg_speed) === 'number' ? ((s.avg_speed ?? s.enhanced_avg_speed) * 3.6).toFixed(1) + ' km/h' : '—', typeof (s.max_speed ?? s.enhanced_max_speed) === 'number' ? 'max ' + ((s.max_speed ?? s.enhanced_max_speed) * 3.6).toFixed(1) + ' km/h' : '') +
+      kpiCard('Dénivelé +', typeof s.total_ascent === 'number' ? Math.round(s.total_ascent) + ' m' : '—', typeof s.total_descent === 'number' ? '−' + Math.round(s.total_descent) + ' m' : '');
+    // graphique à la seconde sur la plage de la séance
+    const m = METRICS[state.metriqueSeance];
+    let pts = [];
+    if (plage) {
+      pts = store.recordsSorted()
+        .filter(r => r.t >= plage[0] - 6e4 && r.t <= plage[1] + 6e4)
+        .map(r => {
+          let v = r[m.field];
+          if (typeof v !== 'number' && m.altField) v = r[m.altField];
+          return { x: r.t, y: typeof v === 'number' ? v * (m.mul || 1) : null, date: localDayKey(r.t) };
+        });
+    }
+    const opts = { color: m.color, seuilMin: state.seuilMin, seuilMax: state.seuilMax, horsSeuil: true, fmtX: fmtHeure, fmtY: v => v.toFixed(m.decimals), msgVide: 'Aucun record sur cette séance' };
+    if (state.metriqueSeance === 'heart_rate') {
+      const hz = getHrZones(store);   // zones FC en fond (hr_zone du fichier ou % FCmax)
+      opts.zones = hz.zones;
+    }
+    const map = drawLineChart($('chartSeance'), pts, opts);
+    $('legendeSeance').innerHTML = legendeHtml(m, opts);
+    bindChartInteractions($('chartSeance'), $('tooltip2'), map, pts, q => fmtHeure(q.x) + ' — ' + fmtMetrique(m, q.y), null);
+    // laps de la séance
+    const laps = plage ? store.laps
+      .filter(l => { const lt = l.t ?? (l.start_time ? Date.parse(l.start_time) : null); return lt !== null && lt >= plage[0] - 6e4 && lt <= plage[1] + 6e4; })
+      .sort((a, b) => (a.t ?? 0) - (b.t ?? 0)) : [];
+    if (laps.length) {
+      $('carteLaps').style.display = 'block';
+      let html = '<thead><tr><th>Début</th><th>Durée</th><th>Distance</th><th>FC moy</th><th>FC max</th><th>Allure moy</th></tr></thead><tbody>';
+      for (const l of laps) {
+        const lt = l.t ?? (l.start_time ? Date.parse(l.start_time) : null);
+        html += '<tr><td>' + (lt ? fmtHeure(lt) : '—') + '</td>' +
+          '<td>' + (l.total_elapsed_time ? fmtDuree(l.total_elapsed_time) : '—') + '</td>' +
+          '<td>' + (typeof l.total_distance === 'number' ? (l.total_distance / 1000).toFixed(2) + ' km' : '—') + '</td>' +
+          '<td>' + (l.avg_heart_rate ?? '—') + '</td><td>' + (l.max_heart_rate ?? '—') + '</td>' +
+          '<td>' + (typeof l.avg_speed === 'number' ? (l.avg_speed * 3.6).toFixed(1) + ' km/h' : '—') + '</td></tr>';
+      }
+      $('tableLaps').innerHTML = html + '</tbody>';
+    } else $('carteLaps').style.display = 'none';
+    // carte GPS si positions disponibles sur la plage
+    const gps = store.gps.filter(g => !plage || (g.t >= plage[0] - 6e4 && g.t <= plage[1] + 6e4));
+    if (gps.length > 1) { $('carteCarteGps').style.display = 'block'; drawCarteGps(gps); }
+    else $('carteCarteGps').style.display = 'none';
+  }
+  /* Export CSV des agrégats journaliers (santé), 100 % local. */
+  function exportCsvJours() {
+    const agg = dailyAgg(store);
+    const rows = Array.from(agg.values()).sort((a, b) => a.date.localeCompare(b.date));
+    const head = ['date', 'pas', 'distance_km', 'calories_kcal', 'temps_actif_min', 'fc_moy_bpm', 'fc_min_bpm', 'fc_max_bpm', 'fc_repos_bpm', 'stress_moy'];
+    const lines = [head.join(';')];
+    for (const r of rows) {
+      lines.push([r.date,
+        r.steps ?? '', r.distance !== null ? (r.distance / 1000).toFixed(2) : '',
+        r.calories ?? '', r.active_time !== null ? (r.active_time / 60).toFixed(0) : '',
+        r.hr_avg !== null ? r.hr_avg.toFixed(1) : '', r.hr_min ?? '', r.hr_max ?? '',
+        r.hr_rest ?? '', r.stress_avg !== null ? r.stress_avg.toFixed(1) : ''].join(';'));
+    }
+    const csv = '﻿' + lines.join('\n');
+    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'garmin-jours.csv';
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+    setStatut('Export CSV : ' + rows.length + ' jour(s) exporté(s).');
+  }
+  /* Carte « Appareil & profil » (device_info, user_profile, file_id). */
+  function renderAppareil() {
+    const carte = $('carteAppareil');
+    const di = (store.other.device_info || []).slice(-1)[0];
+    const fid = store.files.filter(f => f.parsed).map(f => f.parsed.messages.find(m => m.name === 'file_id')).find(Boolean);
+    const up = store.userProfile || {};
+    const lignes = [];
+    if (fid) {
+      lignes.push('<b>Fichier :</b> ' + esc(fileTypeLabel(fid.fields.type)) +
+        (fid.fields.manufacturer != null ? ', fabricant ' + esc(manufacturerLabel(fid.fields.manufacturer)) : '') +
+        (fid.fields.product_name ? ', produit ' + esc(fid.fields.product_name) : '') +
+        (fid.fields.serial_number ? ', n° série ' + esc(fid.fields.serial_number) : ''));
+    }
+    if (di) {
+      lignes.push('<b>Appareil :</b>' +
+        (di.manufacturer != null ? ' ' + esc(manufacturerLabel(di.manufacturer)) : '') +
+        (di.product != null ? ', produit ' + esc(di.product) : '') +
+        (di.software_version != null ? ', logiciel ' + esc(di.software_version) : '') +
+        (di.battery_status != null ? ', batterie ' + esc(di.battery_status) : ''));
+    }
+    if (up && Object.keys(up).length) {
+      lignes.push('<b>Profil :</b>' +
+        (up.age ? ' ' + esc(up.age) + ' ans' : '') +
+        (up.gender != null ? ', ' + esc(up.gender === 0 ? 'homme' : 'femme') : '') +
+        (up.weight ? ', ' + esc(up.weight) + ' kg' : '') +
+        (up.height ? ', ' + esc(up.height) + ' m' : '') +
+        (up.resting_heart_rate ? ', FC repos ' + esc(up.resting_heart_rate) + ' bpm' : '') +
+        (up.default_max_heart_rate ? ', FC max ' + esc(up.default_max_heart_rate) + ' bpm' : ''));
+    }
+    if (!lignes.length) { carte.style.display = 'none'; return; }
+    carte.style.display = 'block';
+    $('infosAppareil').innerHTML = lignes.map(l => '<div>' + l + '</div>').join('');
+  }
+  /* Export GPX de la séance sélectionnée (points GPS + FC/cadence), 100 % local. */
+  function exportGpxSeance() {
+    if (!seanceSel) return;
+    const plage = seancePlage(seanceSel);
+    const pts = store.gps.filter(g => !plage || (g.t >= plage[0] - 6e4 && g.t <= plage[1] + 6e4));
+    if (!pts.length) return;
+    const recByT = new Map();
+    for (const r of store.recordsSorted()) recByT.set(r.t, r);
+    let trkpts = '';
+    for (const g of pts) {
+      const rec = recByT.get(g.t) || {};
+      const hr = typeof rec.heart_rate === 'number' ? '<gpxtpx:hr>' + rec.heart_rate + '</gpxtpx:hr>' : '';
+      const cad = typeof rec.cadence === 'number' ? '<gpxtpx:cad>' + rec.cadence + '</gpxtpx:cad>' : '';
+      trkpts += '<trkpt lat="' + g.lat.toFixed(6) + '" lon="' + g.long.toFixed(6) + '">' +
+        (typeof g.alt === 'number' ? '<ele>' + g.alt.toFixed(1) + '</ele>' : '') +
+        '<time>' + new Date(g.t).toISOString() + '</time>' +
+        (hr || cad ? '<extensions><gpxtpx:TrackPointExtension>' + hr + cad + '</gpxtpx:TrackPointExtension></extensions>' : '') +
+        '</trkpt>';
+    }
+    const gpx = '<?xml version="1.0" encoding="UTF-8"?>\n' +
+      '<gpx version="1.1" creator="Garmin Connect local" xmlns="http://www.topografix.com/GPX/1/1" xmlns:gpxtpx="http://www.garmin.com/xmlschemas/TrackPointExtension/v1">' +
+      '<trk><name>' + esc(sportLabel(seanceSel.sport)) + ' ' + (plage ? new Date(plage[0]).toISOString().slice(0, 10) : '') + '</name><trkseg>' + trkpts + '</trkseg></trk></gpx>';
+    const blob = new Blob([gpx], { type: 'application/gpx+xml' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'activite-' + (plage ? new Date(plage[0]).toISOString().slice(0, 10) : 'export') + '.gpx';
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+  }
+  /* Tracé GPS simple (projection équirectangulaire locale) sur canvas. */
+  function drawCarteGps(gps) {
+    const { ctx, w, h } = prepCanvas($('carteGps'));
+    ctx.clearRect(0, 0, w, h);
+    const lats = gps.map(g => g.lat), longs = gps.map(g => g.long);
+    const la0 = Math.min(...lats), la1 = Math.max(...lats), lo0 = Math.min(...longs), lo1 = Math.max(...longs);
+    const pad = 24;
+    const cw = w - 2 * pad, ch = h - 2 * pad;
+    const sx = cw / (lo1 - lo0 || 1e-9), sy = ch / (la1 - la0 || 1e-9);
+    const s = Math.min(sx, sy);
+    const ox = pad + (cw - (lo1 - lo0) * s) / 2, oy = pad + (ch - (la1 - la0) * s) / 2;
+    const X = lo => ox + (lo - lo0) * s;
+    const Y = la => h - pad - (ch - (la1 - la0) * s) / 2 - (la - la0) * s;
+    // fond
+    ctx.fillStyle = '#f8fafc'; ctx.fillRect(0, 0, w, h);
+    // tracé
+    const MAXPTS = 2000;
+    const pts = lttb(gps.map(g => ({ x: g.long, y: g.lat })), MAXPTS);
+    ctx.strokeStyle = '#007cc3'; ctx.lineWidth = 2; ctx.beginPath();
+    pts.forEach((p, i) => { const x = X(p.x), y = Y(p.y); if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y); });
+    ctx.stroke();
+    // départ (vert) / arrivée (rouge)
+    ctx.fillStyle = '#0e9f6e'; ctx.beginPath(); ctx.arc(X(gps[0].long), Y(gps[0].lat), 5, 0, 7); ctx.fill();
+    ctx.fillStyle = '#dc2626'; ctx.beginPath(); ctx.arc(X(gps[gps.length - 1].long), Y(gps[gps.length - 1].lat), 5, 0, 7); ctx.fill();
+  }
+  /* Tableau des séances (réutilisé par accueil). */
+  function renderTableSeances(tb, titreEl, from, to, sport) {
+    titreEl.textContent = sport === 'tout' ? 'Séances récentes' : 'Séances récentes — ' + sportLabel(Number(sport));
+    let rows = store.sessions
+      .filter(s => sport === 'tout' || String(s.sport) === String(sport))
+      .filter(s => { const t = s.startMs ?? s.t; return t >= from - 1 && t <= to + 864e5; })
+      .sort((a, b) => (b.startMs ?? b.t ?? 0) - (a.startMs ?? a.t ?? 0))
+      .slice(0, 20);
+    if (!rows.length) { tb.innerHTML = '<tbody><tr><td class="petit">Aucune séance sur la période.</td></tr></tbody>'; return; }
+    let html = '<thead><tr><th>Date</th><th>Sport</th><th>Durée</th><th>Distance</th><th>Calories</th><th>FC moy</th><th>FC max</th><th>Statut</th></tr></thead><tbody>';
+    for (const s of rows) {
+      const t = s.startMs ?? s.t;
+      let statut = '<span class="badge ok">OK</span>';
+      if (state.seuilMax !== null && typeof s.max_heart_rate === 'number' && s.max_heart_rate > state.seuilMax)
+        statut = '<span class="badge alert">ALERTE</span>';
+      html += '<tr><td>' + (t ? fmtDateHeure(t) : '—') + '</td>' +
+        '<td>' + esc(sportLabel(s.sport)) + '</td>' +
+        '<td>' + (s.total_elapsed_time ? fmtDuree(s.total_elapsed_time) : '—') + '</td>' +
+        '<td>' + (typeof s.total_distance === 'number' ? (s.total_distance / 1000).toFixed(2) + ' km' : '—') + '</td>' +
+        '<td>' + (s.total_calories ?? '—') + '</td>' +
+        '<td>' + (s.avg_heart_rate ?? '—') + '</td>' +
+        '<td>' + (s.max_heart_rate ?? '—') + '</td>' +
+        '<td>' + statut + '</td></tr>';
+    }
+    tb.innerHTML = html + '</tbody>';
+  }
+
+  /* ---------- SANTÉ ---------- */
+  function renderSante() {
+    const has = store.monitoring.length > 0 || store.stress.length > 0 || store.hrPoints.length > 0 || store.restingHr.length > 0;
+    $('bandeauVideSante').style.display = has ? 'none' : 'block';
+    $('contenuSante').style.display = has ? 'block' : 'none';
+    if (!has) return;
+    if (!METRICS[state.metrique] || METRICS[state.metrique].source === 'record') {
+      state.metrique = 'steps';
+      $('selMetrique').value = 'steps';
+    }
+    const k = computeKPIs(store, state.metrique, state.periode, 'tout', state.custom);
+    const m = METRICS[state.metrique];
+    $('kpiSante').innerHTML =
+      kpiCard('Moyenne ' + m.label.toLowerCase(), fmtMetrique(m, k.moy), periodeLabel(state.periode)) +
+      kpiCard('Minimum', fmtMetrique(m, k.min), '') +
+      kpiCard('Maximum', fmtMetrique(m, k.max), '') +
+      kpiCard('Tendance', tendanceHtml(k.tendance), 'vs 7 j précédents') +
+      kpiCard('Séances', String(k.seances), 'dans la période');
+    renderGraphiqueVue('Sante', state.metrique, k.series, state.zoomSante, d => { state.zoomSante = d; renderSante(); });
+    renderTableJours($('tableSante'), null, k.series);
+    // temps dans les zones de FC (barres empilées, depuis les séances)
+    const zt = zoneTimeByDay(store, k.from, k.to);
+    if (zt.series.length) {
+      $('carteZones').style.display = 'block';
+      drawStackedBars($('chartZones'), zt.series, zt.zones);
+      $('legendeZones').innerHTML = zt.zones.map(z =>
+        '<span class="item"><span style="display:inline-block;width:10px;height:10px;border-radius:2px;background:' + z.color + '"></span>' + esc(z.label) + '</span>').join('');
+    } else $('carteZones').style.display = 'none';
+  }
+  /* Tableau des derniers jours avec statut OK/alerte selon les seuils.
+     titreEl optionnel : élément de titre à mettre à jour (null = inchangé). */
+  function renderTableJours(tb, titreEl, series) {
+    const m = METRICS[state.metriqueAccueil && tb.id === 'tableAccueil' ? state.metriqueAccueil : state.metrique];
+    const rows = series.slice(-30).reverse();
+    if (titreEl) titreEl.textContent = 'Derniers jours — ' + m.label;
+    if (!rows.length) { tb.innerHTML = '<tbody><tr><td class="petit">Aucune donnée sur la période.</td></tr></tbody>'; return; }
+    let html = '<thead><tr><th>Date</th><th>' + esc(m.label) + '</th><th>Statut</th></tr></thead><tbody>';
+    for (const r of rows) {
+      const hs = (state.seuilMin !== null && state.seuilMin !== undefined && r.y < state.seuilMin) ||
+                 (state.seuilMax !== null && state.seuilMax !== undefined && r.y > state.seuilMax);
+      html += '<tr><td>' + new Date(r.x).toLocaleDateString('fr-FR', { weekday: 'short', day: '2-digit', month: '2-digit', year: '2-digit' }) + '</td>' +
+        '<td>' + fmtMetrique(m, r.y) + '</td>' +
+        '<td>' + (hs ? '<span class="badge alert">ALERTE</span>' : '<span class="badge ok">OK</span>') + '</td></tr>';
+    }
+    tb.innerHTML = html + '</tbody>';
+  }
+
+  /* ---------- SOMMEIL ---------- */
+  function renderSommeil() {
+    const nuits = sleepNights(store);
+    const has = nuits.length > 0;
+    $('bandeauVideSommeil').style.display = has ? 'none' : 'block';
+    $('contenuSommeil').style.display = has ? 'block' : 'none';
+    if (!has) return;
+    const durees = nuits.filter(n => n.duree_s > 0).map(n => n.duree_s);
+    const moy = durees.length ? durees.reduce((a, b) => a + b, 0) / durees.length : null;
+    const dern = nuits[nuits.length - 1];
+    $('kpiSommeil').innerHTML =
+      kpiCard('Nuits détectées', String(nuits.length), 'messages sleep_level') +
+      kpiCard('Durée moyenne', moy === null ? '—' : fmtDuree(moy), '') +
+      kpiCard('Dernière nuit', dern ? fmtDuree(dern.duree_s) : '—', dern ? 'nuit du ' + fmtJour(dern.x) : '') +
+      kpiCard('Tranches', String(store.sleepLevels.length), 'niveaux de sommeil');
+    const pts = nuits.map(n => ({ x: n.x, y: n.duree_s / 3600, date: n.date }));
+    drawLineChart($('chartSommeil'), pts, { color: '#6366f1', barres: true, fmtX: fmtJour, fmtY: v => v.toFixed(1) + ' h', msgVide: 'Aucune donnée de sommeil' });
+    $('legendeSommeil').innerHTML = '<span class="item"><span class="trait" style="border-color:#6366f1"></span>Durée de sommeil (h)</span>';
+    const tb = $('tableSommeil');
+    let html = '<thead><tr><th>Nuit</th><th>Durée</th><th>Profond</th><th>Léger</th><th>REM</th><th>Éveillé</th></tr></thead><tbody>';
+    for (const n of nuits.slice(-30).reverse()) {
+      const lv = n.levels || {};
+      html += '<tr><td>' + new Date(n.x).toLocaleDateString('fr-FR', { weekday: 'short', day: '2-digit', month: '2-digit', year: '2-digit' }) + '</td>' +
+        '<td>' + (n.duree_s > 0 ? fmtDuree(n.duree_s) : '—') + '</td>' +
+        '<td>' + (lv[3] || 0) + '</td><td>' + (lv[2] || 0) + '</td><td>' + (lv[4] || 0) + '</td><td>' + (lv[1] || 0) + '</td></tr>';
+    }
+    tb.innerHTML = html + '</tbody>';
+  }
+
+  bindControles();
+  renderStatut();
+  renderVueCourante();
+}
+
+if (typeof module !== 'undefined' && module.exports) {
+  module.exports = { FitParser, DataStore, fitCrc16, applyCompressedOffset, GLOBAL_MESSAGES, FIELD_DEFS, ENUMS, FIT_EPOCH_MS, fitTimestampMs,
+    METRICS, PERIODES, lttb, dailySeries, movingAverage, periodBounds, dailyAgg, dailyMetricSeries, recordSeriesFor, computeKPIs, sleepNights, sleepDayKey, getHrZones, zoneTimeByDay, localDayKey, dayStartMs,
+    sportLabel, fileTypeLabel };
+}
+if (typeof document !== 'undefined') {
+  document.addEventListener('DOMContentLoaded', initUI);
+}
+</script>
+</body>
+</html>
